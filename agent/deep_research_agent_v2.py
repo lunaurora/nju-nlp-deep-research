@@ -396,6 +396,7 @@ You MUST call search() at least once before giving any answer. Never answer from
 
 - **search(query: str)** — Search the corpus. Returns top document snippets with docid and score.
 - **get_document(docid: str)** — Retrieve a full document by ID for detailed reading.
+- **find_in_doc(docid, keyword)** — Search within a document for a keyword, returns matching lines with context.
 
 ## Research Process: Three Phases
 

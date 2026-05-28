@@ -86,6 +86,22 @@ def get_agent_tool_specs_and_registry(
             return {"docid": docid, "error": "document not found"}
         return doc
 
+    def find_in_doc(docid: str, keyword: str) -> Dict[str, Any]:
+        """Search within a specific document for a keyword, return matching lines."""
+        doc = searcher.get_document(docid)
+        if doc is None:
+            return {"docid": docid, "error": "document not found"}
+        text = doc.get("text", "")
+        lines = text.split("\n")
+        matches = []
+        for i, line in enumerate(lines):
+            if keyword.lower() in line.lower():
+                start = max(0, i - 1)
+                end = min(len(lines), i + 2)
+                context = "\n".join(lines[start:end])
+                matches.append({"line": i, "context": context.strip()[:500]})
+        return {"docid": docid, "keyword": keyword, "matches": matches, "total_matches": len(matches)}
+
     tools = [
         {
             "type": "function",
@@ -118,5 +134,20 @@ def get_agent_tool_specs_and_registry(
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "find_in_doc",
+                "description": "Search within a specific document for a keyword, returning matching lines with surrounding context.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "docid": {"type": "string", "description": "Document id to search within"},
+                        "keyword": {"type": "string", "description": "Keyword or phrase to find in the document"},
+                    },
+                    "required": ["docid", "keyword"],
+                },
+            },
+        },
     ]
-    return tools, {"search": search, "get_document": get_document}
+    return tools, {"search": search, "get_document": get_document, "find_in_doc": find_in_doc}

@@ -22,6 +22,7 @@ You MUST call search() at least once before giving any answer. Never answer from
 
 - **search(query: str)** — Search the corpus. Returns top-10 document snippets with docid and score.
 - **get_document(docid: str)** — Read a full document by its docid.
+- **find_in_doc(docid, keyword)** — Search within a document for a keyword, returns matching lines with context.
 
 ## Research Process: Three Phases
 
@@ -197,13 +198,37 @@ class DeepResearchAgent:
                 assistant_msg["tool_calls"] = tool_calls
             messages.append(assistant_msg)
 
+            # ── Retry round 1: Qwen3 thinking mode often skips tool calls ──
+            if not tool_calls and round_idx == 1:
+                messages.append({
+                    "role": "user",
+                    "content": "CRITICAL: Call search() with relevant keywords. Never answer from training data.",
+                })
+                response = self.client.simple_chat(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=128,
+                    tools=self.tool_specs,
+                    tool_choice={"type": "function", "function": {"name": "search"}},
+                )
+                choice = response["choices"][0]
+                message = choice["message"]
+                content = message.get("content") or ""
+                tool_calls = message.get("tool_calls") or []
+
+                assistant_msg = {"role": "assistant", "content": content}
+                if tool_calls:
+                    assistant_msg["tool_calls"] = tool_calls
+                messages.append(assistant_msg)
+
             # ── Model decided to answer directly ──
             if not tool_calls:
                 return {
                     "query_id": query_id,
                     "question": question,
                     "predicted_answer": extract_answer(content),
-                    "status": "completed",
+                    "status": "no_tool_call",
                     "messages": messages,
                     "num_tool_calls": num_tool_calls,
                     "rounds_used": round_idx,
