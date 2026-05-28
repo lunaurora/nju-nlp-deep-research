@@ -189,9 +189,18 @@ def rewrite_query(
         response = client.simple_chat(
             model=model_name, messages=messages, temperature=0.3, max_tokens=256
         )
-        query = response["choices"][0]["message"]["content"].strip()
-        # Clean up: remove quotes if present
+        raw = response["choices"][0]["message"]["content"]
+        query = raw.strip()
+        # Strip thinking markers (Qwen3 thinking mode may add these)
+        if "Final Answer:" in query:
+            query = query.split("Final Answer:")[-1].strip()
+        # Remove quotes if present
         query = query.strip("\"'")
+        # Remove newlines — must be a single-line query
+        query = query.split("\n")[0].strip()
+        # Fallback if empty after cleaning
+        if not query:
+            return question
         return query
     except Exception:
         return question
@@ -201,10 +210,17 @@ def rewrite_query(
 #  模块 4: Relevance Filter
 # ═══════════════════════════════════════════════════════════════
 
-RELEVANCE_FILTER_PROMPT = """You are a document relevance judge. Given a question and a search result,
-determine if the document is relevant.
+RELEVANCE_FILTER_PROMPT = """You are a document relevance judge. Given a question and a list of search result snippets,
+select which documents (by number) contain information relevant to answering the question.
 
-Reply with exactly one word: RELEVANT or IRRELEVANT"""
+Question:
+__QUESTION__
+
+Documents:
+__DOC_LIST__
+
+Reply with the comma-separated list of relevant document numbers only (e.g., "1, 3, 5").
+If none are relevant, reply with "NONE"."""
 
 
 def filter_relevant_docs(
@@ -212,30 +228,44 @@ def filter_relevant_docs(
     question: str, results: List[Dict[str, Any]],
     max_docs: int = 5,
 ) -> List[Dict[str, Any]]:
-    """Filter search results to keep only relevant documents."""
-    relevant = []
-    for doc in results:
-        snippet = doc.get("snippet", "")[:500]
-        messages = [
-            {"role": "system", "content": RELEVANCE_FILTER_PROMPT},
-            {
-                "role": "user",
-                "content": f"Question: {question}\n\nDocument snippet:\n{snippet}",
-            },
-        ]
-        try:
-            response = client.simple_chat(
-                model=model_name, messages=messages, temperature=0.0, max_tokens=16
-            )
-            judgment = response["choices"][0]["message"]["content"].strip().upper()
-            if "RELEVANT" in judgment:
-                relevant.append(doc)
-                if len(relevant) >= max_docs:
-                    break
-        except Exception:
-            relevant.append(doc)  # keep on error
+    """Filter search results using a single batched LLM call."""
+    if not results:
+        return []
 
-    return relevant if relevant else results[:max_docs]  # fallback
+    if len(results) <= 3:
+        return results[:max_docs]
+
+    doc_lines = []
+    for i, doc in enumerate(results, 1):
+        snippet = doc.get("snippet", "")
+        doc_lines.append(f"[{i}] (score={doc['score']:.2f}) {snippet[:300]}")
+
+    try:
+        prompt = RELEVANCE_FILTER_PROMPT.replace("__QUESTION__", question)
+        prompt = prompt.replace("__DOC_LIST__", "\n".join(doc_lines))
+        messages = [{"role": "system", "content": prompt}]
+        response = client.simple_chat(
+            model=model_name, messages=messages, temperature=0.0, max_tokens=128
+        )
+        text = response["choices"][0]["message"]["content"].strip()
+
+        if text.upper() == "NONE":
+            return results[:max_docs]
+
+        indices = []
+        for part in text.split(","):
+            part = part.strip()
+            if part.isdigit():
+                idx = int(part) - 1
+                if 0 <= idx < len(results):
+                    indices.append(idx)
+
+        if indices:
+            return [results[i] for i in indices[:max_docs]]
+    except Exception:
+        pass
+
+    return results[:max_docs]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -344,44 +374,63 @@ def verify_answer(
 
 
 # ═══════════════════════════════════════════════════════════════
+#  Utility
+# ═══════════════════════════════════════════════════════════════
+
+def extract_answer(text: str) -> str:
+    """Extract Exact Answer from model output."""
+    match = re.search(r'Exact Answer:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
+    return match.group(1).strip() if match else text.strip()
+
+
+# ═══════════════════════════════════════════════════════════════
 #  V2 System Prompt
 # ═══════════════════════════════════════════════════════════════
 
-V2_SYSTEM_PROMPT = """You are a Deep Research Agent V2 — an advanced multi-hop retrieval system.
+V2_SYSTEM_PROMPT = """You are a Deep Research Agent. Your task is to search a document corpus to answer complex questions by gathering evidence across multiple rounds.
 
 ## Available Tools
 
-1. **search(query: str)** — Search the corpus. Returns top documents with snippets.
-2. **get_document(docid: str)** — Retrieve a full document by ID for detailed reading.
+- **search(query: str)** — Search the corpus. Returns top document snippets with docid and score.
+- **get_document(docid: str)** — Retrieve a full document by ID for detailed reading.
 
-## How to Work
+## Research Process: Three Phases
 
-You operate in rounds. Each round you should:
+### Phase 1 — Gather (Round 1-2)
+1. Extract key entities from the question (names, dates, places, unique terms)
+2. Start with specific queries targeting the most distinctive terms
+3. If specific queries return little, broaden your terms
 
-1. **Review** the evidence status provided to you.
-2. **Reason** about what is still missing.
-3. **Search** or **Read** to fill the gaps.
-4. **Track** what you've confirmed.
+### Phase 2 — Analyze & Refine (Round 3-5)
+1. After each search, identify what new information each result provides
+2. Track what you know and what is still missing
+3. When a snippet looks promising, use get_document() to read the full text
+4. Cross-reference facts across multiple documents
+5. If stuck, try synonyms or related terms — do NOT repeat the same query
+
+### Phase 3 — Answer
+Only stop searching when you have sufficient evidence to answer confidently.
+
+## Search Strategies
+- Use the most specific unique names, dates, IDs first
+- Vary keywords: try different combinations of known entities
+- Read full documents when snippets contain relevant information
+
+## When to Stop
+
+(a) **Clear evidence found** — You have direct evidence answering the core question → answer with confidence
+(b) **No new information** — Your last 2 searches returned only documents you have already examined → give Best Guess
+(c) **Maximum rounds** reached → give Best Guess
 
 ## Output Format
 
-When calling tools:
-- You may call multiple tools if they are independent.
-- Each call helps you get closer to the answer.
+When you are ready to answer, output exactly:
 
-When you have sufficient evidence, output:
+Explanation: <one sentence showing what evidence supports your answer>
+Exact Answer: <concise, complete answer>
+Confidence: <high|medium|low>
 
-Explanation: <step-by-step reasoning showing how the evidence supports your answer>
-Exact Answer: <concise final answer>
-Confidence: <percentage>%
-
-## Rules
-
-- Search at least 2-3 times to gather broad evidence before narrowing down.
-- Use get_document to read full text when snippets show promise.
-- Always cite specific evidence from the documents.
-- If stuck, try different keywords or synonyms.
-- Never fabricate evidence or answer from memory."""
+Otherwise, call search() or get_document() to continue gathering evidence."""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -431,18 +480,23 @@ class DeepResearchAgentV2:
         self.tool_registry = registry
 
     def solve(self, question: str, query_id: Optional[str] = None) -> Dict[str, Any]:
-        """Run the agent on a single question."""
+        """Run the agent on a single question using native ReAct loop."""
         tracker = EvidenceTracker()
+        search_queries_used = []
 
         # ── Step 1: Analyze the question ──────────────────────
         if self.use_analyzer:
             analysis = analyze_question(self.client, question, self.model_name)
             tracker.sub_questions = analysis["sub_questions"]
             initial_queries = analysis["search_plan"]
-            analysis_note = f"[Question Analysis]\n{analysis['raw_analysis']}\n"
+            analysis_context = (
+                f"[Question Analysis]\n{analysis['raw_analysis']}\n\n"
+                f"Initial search suggestions:\n" +
+                "\n".join(f"  - search(\"{q}\")" for q in initial_queries[:3])
+            )
         else:
             initial_queries = [question]
-            analysis_note = ""
+            analysis_context = ""
 
         # ── Step 2: Build messages ────────────────────────────
         messages: List[Dict[str, Any]] = [
@@ -450,120 +504,56 @@ class DeepResearchAgentV2:
             {"role": "user", "content": f"Research Question: {question}"},
         ]
 
-        if analysis_note:
+        if analysis_context:
             messages.append({
                 "role": "assistant",
-                "content": f"I'll analyze this question systematically.\n\n{analysis_note}\nLet me start by searching for key information.",
+                "content": f"I'll analyze the question systematically, then search for evidence.\n\n{analysis_context}",
             })
 
         num_tool_calls = 0
         compress_triggered = False
-        search_queries_used = []
+        last_round_no_tool = False
+        no_new_doc_rounds = 0
 
-        # ── Step 3: ReAct Loop ────────────────────────────────
+        # ── Step 3: Native ReAct Loop ────────────────────────
         for round_idx in range(1, self.max_rounds + 1):
 
-            # --- Context Compression ---
+            # --- Context Compression (once, after round 5) ---
             if self.use_compressor and not compress_triggered and round_idx >= self.compress_after_round:
                 compressed = compress_context(
                     self.client, self.model_name, question, messages, tracker
                 )
                 if compressed:
-                    # Keep system + question + evidence summary + last 2 rounds
-                    keep = messages[:2]  # system + question/analysis
+                    keep = messages[:2]  # system + question
                     keep.append({
                         "role": "user",
                         "content": f"[Context Summary — earlier rounds compressed]\n\n{compressed}",
                     })
-                    # Add last 3 messages (the most recent round)
                     if len(messages) > 4:
                         keep.extend(messages[-4:])
                     messages = keep
                     compress_triggered = True
 
-            # --- Decide query strategy ---
-            if round_idx == 1:
-                # Use initial queries
-                current_queries = initial_queries[:2]
-            elif self.use_rewriter and search_queries_used:
-                # Generate a refined query
-                new_query = rewrite_query(
+            # --- Inject Query Rewriter hint if stuck (round 3+) ---
+            if (self.use_rewriter and round_idx >= 3
+                    and search_queries_used and round_idx % 2 == 1):
+                hint = rewrite_query(
                     self.client, self.model_name, question, tracker, search_queries_used
                 )
-                current_queries = [new_query]
-            else:
-                current_queries = [question]
+                if hint and hint not in search_queries_used:
+                    messages.append({
+                        "role": "user",
+                        "content": f"Hint: The missing information might be found by searching for: \"{hint}\"",
+                    })
 
-            # --- Execute searches ---
-            tool_calls_to_execute = []
-            for q in current_queries:
-                if q not in search_queries_used:
-                    tool_calls_to_execute.append(q)
-
-            if not tool_calls_to_execute:
-                # Already searched everything — force a broader query
-                tool_calls_to_execute = [question]
-
-            # Build assistant message requesting tools
-            assistant_content = (
-                f"[Round {round_idx}] Searching for missing information...\n"
-                f"Queries: {tool_calls_to_execute}"
-            )
-            assistant_msg = {
-                "role": "assistant",
-                "content": assistant_content,
-                "tool_calls": [
-                    {
-                        "id": f"call_{round_idx}_{ti}",
-                        "type": "function",
-                        "function": {
-                            "name": "search",
-                            "arguments": json.dumps({"query": q}),
-                        },
-                    }
-                    for ti, q in enumerate(tool_calls_to_execute)
-                ],
-            }
-            messages.append(assistant_msg)
-
-            # Execute tools and collect results
-            for ti, q in enumerate(tool_calls_to_execute):
-                num_tool_calls += 1
-                search_queries_used.append(q)
-
-                results = retrieve_once(
-                    searcher=self.searcher, query=q, k=self.top_k
-                )
-                tracker.record_search(q, results)
-
-                # Relevance filter
-                if self.use_filter and results:
-                    filtered = filter_relevant_docs(
-                        self.client, self.model_name, question, results
-                    )
-                else:
-                    filtered = results
-
-                # Format results
-                result_text = json.dumps(
-                    [
-                        {
-                            "docid": d["docid"],
-                            "score": d["score"],
-                            "snippet": d["snippet"][:600],
-                        }
-                        for d in filtered[:5]  # keep top 5 after filtering
-                    ],
-                    ensure_ascii=False,
-                )
-
+            # --- Inject Evidence Tracker status (every 3 rounds) ---
+            if round_idx > 1 and round_idx % 3 == 0:
                 messages.append({
-                    "role": "tool",
-                    "tool_call_id": f"call_{round_idx}_{ti}",
-                    "content": result_text,
+                    "role": "user",
+                    "content": f"[Status Update]\n{tracker.get_status_summary()}\n\nContinue searching if you still need more evidence.",
                 })
 
-            # --- Let model decide next step ---
+            # --- Call vLLM with tool choice auto ──
             response = self.client.simple_chat(
                 model=self.model_name,
                 messages=messages,
@@ -578,94 +568,151 @@ class DeepResearchAgentV2:
             content = message.get("content") or ""
             tool_calls = message.get("tool_calls") or []
 
-            assistant_msg2 = {"role": "assistant", "content": content}
+            assistant_msg = {"role": "assistant", "content": content}
             if tool_calls:
-                assistant_msg2["tool_calls"] = tool_calls
-            messages.append(assistant_msg2)
+                assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
 
-            # If model wants to call more tools, execute them
-            if tool_calls:
-                for tc in tool_calls:
-                    num_tool_calls += 1
-                    fn = tc.get("function", {})
-                    name = fn.get("name", "")
+            # ── Model decided to answer directly ──
+            if not tool_calls:
+                final_answer_text = content
+
+                # --- Verification ---
+                if self.use_verifier:
+                    extracted = extract_answer(final_answer_text)
+                    if extracted:
+                        verification = verify_answer(
+                            self.client, self.model_name, question, extracted, tracker
+                        )
+                        if verification["verdict"] == "UNSUPPORTED":
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"Verification Warning: The evidence does not fully support your answer. "
+                                    f"Reason: {verification['reasoning']}\n\n"
+                                    f"Please review the evidence more carefully and provide a corrected answer.\n"
+                                    f"Format:\nExplanation: <reasoning>\nExact Answer: <answer>\nConfidence: <percentage>"
+                                ),
+                            })
+                            response2 = self.client.simple_chat(
+                                model=self.model_name,
+                                messages=messages,
+                                temperature=self.temperature,
+                                max_tokens=self.max_tokens,
+                            )
+                            final_answer_text = response2["choices"][0]["message"]["content"]
+                            messages.append({"role": "assistant", "content": final_answer_text})
+
+                return {
+                    "query_id": query_id,
+                    "question": question,
+                    "predicted_answer": extract_answer(final_answer_text),
+                    "status": "completed",
+                    "messages": messages,
+                    "num_tool_calls": num_tool_calls,
+                    "rounds_used": round_idx,
+                    "num_searches": len(search_queries_used),
+                    "num_docs_examined": len(tracker.visited_docids),
+                }
+
+            # ── Execute tool calls ──
+            round_docids = set()
+            for tc in tool_calls:
+                num_tool_calls += 1
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                try:
                     args = json.loads(fn.get("arguments", "{}"))
-                    try:
-                        result = self.tool_registry[name](**args)
-                        # Update tracker
-                        if name == "search":
-                            tracker.record_search(args.get("query", ""), result)
-                            search_queries_used.append(args.get("query", ""))
-                        elif name == "get_document":
-                            docid = args.get("docid", "")
-                            if result and isinstance(result, dict):
-                                snippet = result.get("text", "")[:500]
-                                tracker.seen_snippets[docid] = snippet
+                except json.JSONDecodeError:
+                    continue
 
+                try:
+                    result = self.tool_registry[name](**args)
+
+                    if name == "search":
+                        query = args.get("query", "")
+                        tracker.record_search(query, result)
+                        search_queries_used.append(query)
+                        for d in result:
+                            round_docids.add(d["docid"])
+
+                        # Apply relevance filter (batched LLM call)
+                        if self.use_filter and len(result) > 3:
+                            filtered = filter_relevant_docs(
+                                self.client, self.model_name, question, result
+                            )
+                        else:
+                            filtered = result
+
+                        truncated = json.dumps(
+                            [{"docid": d["docid"], "score": d["score"],
+                              "snippet": d.get("snippet", "")[:600]}
+                             for d in filtered[:5]],
+                            ensure_ascii=False,
+                        )
+
+                    elif name == "get_document":
+                        docid = args.get("docid", "")
+                        round_docids.add(docid)
+                        if result and isinstance(result, dict):
+                            snippet = result.get("text", "")[:500]
+                            tracker.seen_snippets[docid] = snippet
                         truncated = json.dumps(result, ensure_ascii=False)
                         if len(truncated) > 3000:
                             truncated = truncated[:3000] + "... [truncated]"
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": truncated,
-                        })
-                    except Exception as e:
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": json.dumps({"error": str(e)}),
-                        })
-                continue  # Continue loop — model will decide again
 
-            # No tool calls → this is the final answer
-            final_answer_text = content
+                    else:
+                        truncated = json.dumps(result, ensure_ascii=False)
 
-            # --- Verification step ---
-            if self.use_verifier:
-                extracted = extract_answer(final_answer_text)
-                verification = verify_answer(
-                    self.client, self.model_name, question, extracted, tracker
-                )
-                if verification["verdict"] == "UNSUPPORTED":
-                    # Add a chance to reconsider
                     messages.append({
-                        "role": "user",
-                        "content": (
-                            f"Verification Warning: The evidence does not fully support your answer. "
-                            f"Reason: {verification['reasoning']}\n\n"
-                            f"Please review the evidence more carefully and provide a corrected answer.\n"
-                            f"Format:\nExplanation: <reasoning>\nExact Answer: <answer>\nConfidence: <%>"
-                        ),
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": truncated,
                     })
-                    response2 = self.client.simple_chat(
-                        model=self.model_name,
-                        messages=messages,
-                        temperature=self.temperature,
-                        max_tokens=self.max_tokens,
-                    )
-                    final_answer_text = response2["choices"][0]["message"]["content"]
-                    messages.append({"role": "assistant", "content": final_answer_text})
+                except Exception as e:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": json.dumps({"error": str(e)}),
+                    })
 
-            return {
-                "query_id": query_id,
-                "question": question,
-                "predicted_answer": extract_answer(final_answer_text),
-                "status": "completed",
-                "messages": messages,
-                "num_tool_calls": num_tool_calls,
-                "rounds_used": round_idx,
-                "num_searches": len(search_queries_used),
-                "num_docs_examined": len(tracker.visited_docids),
-                "verification": verification if self.use_verifier else None,
-            }
+            # ── Check no-new-info stop ──
+            if len(round_docids) == 0:
+                no_new_doc_rounds += 1
+            else:
+                no_new_doc_rounds = 0
 
-        # Max rounds reached
+            if no_new_doc_rounds >= 2 and round_idx >= 3:
+                messages.append({
+                    "role": "user",
+                    "content": "Your last searches returned no new documents. Please give your Best Guess answer now.\n\nFormat:\nExplanation: <reasoning>\nExact Answer: <answer>\nConfidence: low",
+                })
+                response = self.client.simple_chat(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
+                final = response["choices"][0]["message"]["content"]
+                messages.append({"role": "assistant", "content": final})
+                return {
+                    "query_id": query_id,
+                    "question": question,
+                    "predicted_answer": extract_answer(final),
+                    "status": "no_new_info",
+                    "messages": messages,
+                    "num_tool_calls": num_tool_calls,
+                    "rounds_used": round_idx,
+                    "num_searches": len(search_queries_used),
+                    "num_docs_examined": len(tracker.visited_docids),
+                }
+
+        # ── Max rounds — force answer ──
         messages.append({
             "role": "user",
             "content": (
                 "Maximum rounds reached. Provide your best final answer:\n"
-                "Explanation: <reasoning>\nExact Answer: <answer>\nConfidence: <%>"
+                "Explanation: <reasoning>\nExact Answer: <answer>\nConfidence: <percentage>"
             ),
         })
         response = self.client.simple_chat(
@@ -688,12 +735,6 @@ class DeepResearchAgentV2:
             "num_searches": len(search_queries_used),
             "num_docs_examined": len(tracker.visited_docids),
         }
-
-
-def extract_answer(text: str) -> str:
-    """Extract Exact Answer from model output."""
-    match = re.search(r'Exact Answer:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
-    return match.group(1).strip() if match else text.strip()
 
 
 def batch_solve(
