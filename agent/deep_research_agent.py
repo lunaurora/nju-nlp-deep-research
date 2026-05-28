@@ -230,8 +230,8 @@ class DeepResearchAgent:
                 messages = compress_old_rounds(messages, tracker)
                 compress_done = True
 
-            # ── Plan 4: Force tool use in search-only phase (rounds 1-3) ──
-            tool_choice = "required" if round_idx <= search_phase_max_round else "auto"
+            # ── Plan 4: Round 1 uses auto + retry (tool_choice="required" not supported by all vLLM) ──
+            tool_choice = "auto"
 
             # ── Call vLLM ──
             response = self.client.simple_chat(
