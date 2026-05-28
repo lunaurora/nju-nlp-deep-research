@@ -212,7 +212,7 @@ class DeepResearchAgent:
         max_docs_to_read = 3
         auto_loaded_top1 = False
         verify_forced = False
-        search_phase_max_round = 3        # Plan 4: search-only for first N rounds
+        search_phase_max_round = 1        # Plan 4: only round 1 forces tools (was 3 — too restrictive)
         auto_found_docids: set = set()    # Plan 3: track docs with auto find_in_doc
         verify_passed = False             # Plan 5: hardened verification status
         key_terms = _extract_key_terms(question, self.client, self.model_name)
@@ -280,8 +280,8 @@ class DeepResearchAgent:
                     })
                     continue
 
-                # ── Plan 5: Hardened auto-verification ──
-                if "verify_claim" in self.tool_registry and not verify_passed and round_idx < self.max_rounds and unique_docs_read:
+                # ── Plan 5: Hardened auto-verification (skip if near max rounds) ──
+                if "verify_claim" in self.tool_registry and not verify_passed and round_idx < self.max_rounds - 1 and unique_docs_read:
                     verify_forced = True
                     answer_text = extract_answer(content)
                     if answer_text and len(answer_text) > 3:

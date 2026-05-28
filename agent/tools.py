@@ -273,13 +273,35 @@ def get_agent_tool_specs_and_registry(
                 return f"Decomposition failed: {e}"
 
         def verify_claim(claim: str, docids: str) -> str:
-            """Verify a candidate answer against specific documents."""
+            """Verify a candidate answer against specific documents (searches full doc for claim terms, not just first 3000 chars)."""
+            # Extract meaningful keywords from claim for targeted document search
+            claim_words = claim.strip().split()
+            stopwords = {"the", "a", "an", "of", "in", "on", "at", "to", "for", "with", "by", "and", "or", "is", "was", "are", "were", "be", "been", "this", "that", "these", "those", "not", "no", "but", "from", "as", "it", "its", "they", "them", "their", "we", "you", "he", "she", "his", "her", "has", "had", "have", "do", "does", "did", "will", "would", "could", "should", "may", "might", "about", "between", "through", "during", "before", "after", "above", "below", "can", "what", "which", "who", "whom"}
+            key_terms = [w.strip(".,;:!?\"'()[]{}") for w in claim_words if w.lower().strip(".,;:!?\"'()[]{}") not in stopwords and len(w.strip(".,;:!?\"'()[]{}")) > 2]
+            key_terms = list(dict.fromkeys(key_terms))[:8]  # dedup, max 8
+
             doc_texts = []
             for did in docids.split(","):
                 did = did.strip()
                 doc = searcher.get_document(did)
                 if doc:
                     text = doc.get("text", "")
+                    if key_terms:
+                        # Search document for claim-related passages
+                        lines = text.split("\n")
+                        relevant = []
+                        found_lines = set()
+                        for term in key_terms:
+                            for i, line in enumerate(lines):
+                                if term.lower() in line.lower() and i not in found_lines:
+                                    found_lines.add(i)
+                                    start = max(0, i - 2)
+                                    end = min(len(lines), i + 3)
+                                    relevant.append(f"...[line {i}]...\n" + "\n".join(lines[start:end]))
+                        if relevant:
+                            doc_texts.append(f"[Document {did}]:\n" + "\n\n".join(relevant[:5]))
+                            continue
+                    # Fallback: first 3000 chars if no key terms matched
                     doc_texts.append(f"[Document {did}]:\n{text[:3000]}")
             if not doc_texts:
                 return "No valid documents found for the given docids."
@@ -287,7 +309,7 @@ def get_agent_tool_specs_and_registry(
             prompt = (
                 "You are a fact verification assistant. Given documents and a claim, "
                 "determine whether the claim is supported.\n"
-                "Format:\nSupported: YES/NO\nEvidence: <quote>\nCorrect Answer: <the correct answer if the claim was wrong>"
+                "Format:\nSupported: YES/NO\nEvidence: <direct quote from document>\nCorrect Answer: <the correct answer if the claim was wrong>"
             )
             try:
                 resp = client.simple_chat(
