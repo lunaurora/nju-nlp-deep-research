@@ -114,10 +114,50 @@ system prompt → user question → model(tools) → execute tool → append res
 2. **Thinking 模式**: Qwen3 输出 `<think>...</think>` 推理过程后才回答。需要确保 parser 正确处理 thinking 块
 3. **vLLM 路径**: 华为云上模型在 `/opt/huawei/edu-apaas/src/init/Qwen3-8B`，不是 `./Qwen3-8B`
 4. **文件覆盖**: 多次运行 notebook 不覆盖 `submission.jsonl` — 已改为时间戳命名 `submission_MMDD_HHMM.jsonl`
-5. **云上代码同步**: git pull 后 `cp -r * /mnt/workspace/` 同步到工作区
-6. **工作区优先**: 先在 `/mnt/workspace/` 测试验证，确认没问题再复制到持久化存储 `/opt/huawei/.../`
+5. **版本管理**: 每次同步按 `MMDD_N-描述` 建独立文件夹，不覆盖旧版本，方便横向对比
+6. **工作区优先**: 先在版本文件夹里测试验证，确认没问题再复制到持久化存储
 
-## 华为云配置
+## 华为云环境
+
+### 环境概况
+- **平台**: science.lab.huaweicloud.com (Jupyter + 终端)
+- **系统**: Linux (notebook-46833dc5923... pod)
+- **工作目录**: 持久化 `/opt/huawei/edu-apaas/src/init/` | 工作区 `/mnt/workspace/`
+- **模型**: Qwen3-8B (39GB 含缓存), 路径 `/opt/huawei/edu-apaas/src/init/Qwen3-8B`
+- **Claude Code**: 已安装，持久化目录 `/opt/huawei/edu-apaas/src/init/node/`
+- **Claude Code 配置**: `~/.claude/settings.json`，使用 ccSwitch 中转 DeepSeek API
+
+### 持久化存储文件结构 (/opt/huawei/edu-apaas/src/init/deep-research-agent/)
+```
+deep-research-agent/           # Git 仓库（origin→lunaurora/nju-nlp-deep-research）
+├── CLAUDE.md                  # 项目文档（需 git pull 同步）
+├── EXPERIMENT_LOG.md          # 实验记录
+├── README.md / REPORT.md
+├── agent/
+│   ├── deep_research_agent.py    # V1 主线
+│   ├── deep_research_agent_v2.py # V2（有 bug）
+│   ├── tools.py                  # 工具定义
+│   ├── eval.py                   # 评估脚本
+│   ├── vllm_client.py / browsecomp_searcher.py / ...
+├── agent_vllm.ipynb / agent_vllm_deep_research.ipynb / agent_vllm_weather.ipynb
+├── browsecomp-plus-corpus/     # 全量语料
+├── browsecomp_plus_hard50.jsonl
+├── deep-research-agent/        # ⚠ 嵌套目录（旧的完整副本，可能是 cp -r 遗留）
+├── runs/                       # 运行结果
+│   ├── submission_MMDD_HHMM.jsonl
+│   ├── eval_results_MMDD_HHMM.jsonl
+│   └── ...
+├── kernel_meta/                # GPU kernel 缓存
+└── indexes/                    # BM25 索引
+```
+
+### 注意：持久化 vs 工作区
+- **持久化** (`/opt/huawei/.../init/`)：git 仓库所在地，保存实验数据
+- **工作区** (`/mnt/workspace/`)：Jupyter notebook 实际运行目录
+- **版本管理**：每次同步时按 `MMDD_N-描述` 建子文件夹，代码和结果都在里面，方便横向对比
+- **同步步骤**：git pull → 新建版本文件夹 → cp 到该文件夹 → 进该文件夹跑 notebook
+
+### 常用命令
 
 **启动 vLLM:**
 ```bash
@@ -131,11 +171,25 @@ vllm serve /opt/huawei/edu-apaas/src/init/Qwen3-8B \
   --port 8000
 ```
 
-**同步代码:**
+**同步最新代码（保留历史结果）:**
 ```bash
 cd /opt/huawei/edu-apaas/src/init/deep-research-agent
 git pull origin main
-cp -r * /mnt/workspace/
+
+# 按日期+序号建版本文件夹，方便横向对比
+VERSION="0528_2-advanced-tools"
+mkdir -p /mnt/workspace/$VERSION
+cp -r * /mnt/workspace/$VERSION/
+
+# 进该版本目录运行 notebook
+cd /mnt/workspace/$VERSION
+# 然后打开 notebook 或 jupyter lab
+```
+
+**进入 Claude Code（华为云终端）：**
+```bash
+source ~/.bashrc
+claude
 ```
 
 ## 评估

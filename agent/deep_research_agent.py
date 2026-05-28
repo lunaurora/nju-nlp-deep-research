@@ -13,52 +13,32 @@ from .tools import build_searcher, get_agent_tool_specs_and_registry, retrieve_o
 from .vllm_client import VLLMClient
 
 
-SYSTEM_PROMPT = """You are a Deep Research Agent. Your task is to search a document corpus to answer complex questions by gathering evidence across multiple rounds.
+SYSTEM_PROMPT = """You are a Deep Research Agent. Follow these steps STRICTLY in order:
 
-## CRITICAL RULES
-1. You MUST call search() before giving any answer. Never answer from training data.
-2. After search(), if ANY snippet appears relevant, you MUST call get_document() to read the full text. Snippets alone are never sufficient — always verify by reading the full document.
-3. Search at least 2 different queries before considering giving up. If a query returns little, try different keywords.
-4. Your final answer must start with "Exact Answer:" on its own line. Do NOT include <think> tags or long reasoning in your final answer.
-
-## Available Tools
-
-- **search(query)** — Search the corpus. Returns top-10 snippets with docid and score.
-- **get_document(docid)** — Read a full document by its docid.
-- **find_in_doc(docid, keyword)** — Search within a document for a keyword.
-- **decompose_question(question)** — [Advanced] Break a complex question into 2-4 specific, searchable sub-queries. Use this at the START to plan your search.
-- **verify_claim(claim, docids)** — [Advanced] Verify a candidate answer against specific documents. Use this BEFORE your final answer to check your evidence.
-
-## Strategy
-
-### Step 1 — Plan
-If the question involves multiple entities or sub-parts, call decompose_question() to get targeted sub-queries.
-Otherwise, extract the key entities (names, dates, places, unique terms) for your first search.
-
-### Step 2 — Search & Read (Repeat at least 2-3 times)
-1. Call search() with the most specific keywords first
-2. For ANY snippet whose content seems relevant, immediately call get_document() to read the full text
-3. After reading full documents, cross-reference facts across documents
-4. If results are not helpful, try different keywords — do NOT repeat the same query
-5. Never ask a yes/no question as a search query — always use content-bearing keywords
-
-### Step 3 — Verify & Answer
-1. Before answering, call verify_claim() with your candidate answer and the docids of documents that support it
-2. Only then output your final answer with the Exact Answer format
-
-## When to Stop
-
-(a) **Clear evidence** — You have direct evidence from full documents → answer with confidence
-(b) **No new info** — Your last 2 searches returned only documents you have already seen → give Best Guess with low confidence
-(c) **Maximum rounds** reached → give Best Guess
-
-## Output Format
-
-When ready to answer, output exactly:
+STEP 1 — SEARCH: Call search() with specific keywords. Search at least 2-3 different queries.
+STEP 2 — READ FULL DOCUMENTS: After finding relevant results, ALWAYS call get_document() to read the full text. Snippets are NEVER sufficient — always read the complete document.
+STEP 3 — CROSS-REFERENCE: Read multiple documents and compare facts across them.
+STEP 4 — VERIFY: Call verify_claim() to check your answer against the documents.
+STEP 5 — ANSWER: Output in this format:
 
 Explanation: <one sentence showing what evidence supports your answer>
 Exact Answer: <concise, complete answer>
-Confidence: <high|medium|low>"""
+Confidence: <high|medium|low>
+
+## Available Tools
+
+- **search(query)** — Search the corpus. Returns snippets with docid and score.
+- **get_document(docid)** — Read a full document by its docid.
+- **find_in_doc(docid, keyword)** — Search within a document for a keyword.
+- **decompose_question(question)** — [Advanced] Break a complex question into sub-queries.
+- **verify_claim(claim, docids)** — [Advanced] Verify a candidate answer against specific documents.
+
+## CRITICAL RULES
+1. NEVER answer without reading at least 2 full documents first.
+2. After each search, immediately call get_document() on any relevant result.
+3. Call verify_claim() before your final answer to prevent mistakes.
+4. Never include <think> tags in your final answer.
+5. If evidence is insufficient, give Best Guess with low confidence."""
 
 
 def extract_answer(text: str) -> str:
@@ -149,7 +129,7 @@ class DeepResearchAgent:
         self.system_prompt = system_prompt or SYSTEM_PROMPT
 
         tool_specs, tool_registry = get_agent_tool_specs_and_registry(
-            searcher=self.searcher, k=self.top_k, snippet_max_chars=1500,
+            searcher=self.searcher, k=self.top_k, snippet_max_chars=800,
             client=self.client, model_name=self.model_name,
         )
         self.tool_specs = tool_specs
@@ -163,8 +143,21 @@ class DeepResearchAgent:
             {"role": "user", "content": question},
         ]
 
+        # ── Auto-decompose question at start ──
+        if "decompose_question" in self.tool_registry:
+            try:
+                decomp = self.tool_registry["decompose_question"](question)
+                messages.append({
+                    "role": "assistant",
+                    "content": f"I'll research this by searching for:\n{decomp}"
+                })
+            except Exception:
+                pass
+
         num_tool_calls = 0
         compress_done = False
+        doc_read_forced = False
+        verify_forced = False
 
         for round_idx in range(1, self.max_rounds + 1):
             # ── Context compression (once, after round 4) ──
@@ -221,6 +214,14 @@ class DeepResearchAgent:
 
             # ── Model decided to answer directly ──
             if not tool_calls:
+                # Force verification before final answer (once)
+                if "verify_claim" in self.tool_registry and not verify_forced and round_idx < self.max_rounds:
+                    verify_forced = True
+                    messages.append({
+                        "role": "user",
+                        "content": "Before finalizing, call verify_claim() with your candidate answer and the docids of supporting documents to check your evidence."
+                    })
+                    continue
                 return {
                     "query_id": query_id,
                     "question": question,
@@ -232,12 +233,20 @@ class DeepResearchAgent:
                 }
 
             # ── Execute tool calls ──
+            round_has_search = False
+            round_has_getdoc = False
             round_docids = set()
             for tc in tool_calls:
                 num_tool_calls += 1
                 fn = tc.get("function", {})
                 name = fn.get("name", "")
                 args = json.loads(fn.get("arguments", "{}"))
+
+                if name == "search":
+                    round_has_search = True
+                elif name == "get_document":
+                    round_has_getdoc = True
+
                 try:
                     result = self.tool_registry[name](**args)
 
@@ -264,9 +273,19 @@ class DeepResearchAgent:
                         "content": json.dumps({"error": str(e)}),
                     })
 
+            # ── Force get_document (once) if model searches but never reads ──
+            _just_forced_read = False
+            if round_has_search and not round_has_getdoc and not doc_read_forced and round_docids:
+                doc_read_forced = True
+                _just_forced_read = True
+                messages.append({
+                    "role": "user",
+                    "content": "CRITICAL: You must call get_document() now on the most relevant docid to read the full text. Snippets are not sufficient evidence — you must read the complete document."
+                })
+
             # ── Track round results and check stop condition ──
             tracker.record_round(round_docids)
-            if tracker.should_stop and round_idx >= 3:
+            if tracker.should_stop and round_idx >= 3 and not round_has_getdoc and not _just_forced_read:
                 messages.append({
                     "role": "user",
                     "content": "Your last 2 searches returned no new documents. Please give your Best Guess answer now.\n\nFormat:\nExplanation: <reasoning>\nExact Answer: <answer>\nConfidence: low",
