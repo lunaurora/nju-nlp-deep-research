@@ -228,7 +228,7 @@ class DeepResearchAgent:
                     "query_id": query_id,
                     "question": question,
                     "predicted_answer": extract_answer(content),
-                    "status": "no_tool_call",
+                    "status": "completed",
                     "messages": messages,
                     "num_tool_calls": num_tool_calls,
                     "rounds_used": round_idx,
