@@ -1,102 +1,120 @@
 """
 Deep Research Agent — 多轮检索 ReAct Agent for BrowseComp-Plus.
-
-Usage:
-    from agent.deep_research_agent import DeepResearchAgent
-
-    agent = DeepResearchAgent(client, searcher, model_name="qwen_auto")
-    result = agent.solve(question)
+改进版: 更好的 prompt + 无新信息停止 + 上下文管理
 """
 
 import json
 import re
 import time
-from copy import deepcopy
-from typing import Any, Dict, List, Optional, Tuple
+from collections import OrderedDict
+from typing import Any, Dict, List, Optional
 
-from .tools import (
-    build_searcher,
-    get_agent_tool_specs_and_registry,
-    retrieve_once,
-    format_rag_context,
-)
+from .tools import build_searcher, get_agent_tool_specs_and_registry, retrieve_once
 from .vllm_client import VLLMClient
 
 
-SYSTEM_PROMPT = """You are a Deep Research Agent. Your task is to answer complex questions by searching a document corpus.
+SYSTEM_PROMPT = """You are a Deep Research Agent. You search a document corpus to answer questions.
 
 ## Available Tools
 
-1. **search(query: str)** — Search the corpus and return top documents with snippets. Use this to find relevant documents.
-2. **get_document(docid: str)** — Retrieve the full text of a specific document by its ID. Use this when a search snippet looks promising but you need the full context.
+- **search(query: str)** — Search the corpus. Returns top-10 document snippets.
+- **get_document(docid: str)** — Read a full document.
 
-## How to Work
+## How to Search
 
-1. **Analyze** the question carefully. Break it down into the key facts you need to find.
-2. **Search** for each piece of information. Start with broad queries, then refine.
-3. **Read** full documents when snippets contain relevant information.
-4. **Track** what you have found and what is still missing.
-5. **Synthesize** all evidence to form the final answer.
+**Round 1** — Search using the most unique names, dates, or terms from the question.
+**Round 2+** — Look at what you found. If you are missing a piece, search for it using new keywords from the snippets you already got.
 
-## Search Strategy Tips
+Search Tips:
+- Be specific: use quoted names ("Los Angeles"), exact years (1974), unique terms
+- Vary keywords: if one query returns nothing useful, try synonyms
+- Read full docs when a snippet looks promising
 
-- Start with the most unique/ specific terms from the question
-- If a search returns irrelevant results, try different keywords
-- After finding some information, search for the next piece using newly discovered terms
-- Use quotes for multi-word proper names when useful
+## When to Stop and Answer
 
-## Output Format
+Stop when EITHER:
+(a) You have found clear evidence that directly answers the question, OR
+(b) Your last 2 searches returned documents you already examined (no new info)
 
-When you have gathered sufficient evidence, provide your answer in this format:
+If stopping at (b), give your Best Guess with lower confidence.
 
-Explanation: <brief explanation of your reasoning and evidence>
-Exact Answer: <final concise answer>
-Confidence: <percentage>%
+## Output
 
-If you need more information, call a tool instead.
+When you are ready to answer:
 
-## Rules
+Explanation: <one sentence showing your evidence>
+Exact Answer: <concise answer>
+Confidence: <high|medium|low>
 
-- Only answer when you have found clear evidence.
-- Your answer must be based on the retrieved documents, not prior knowledge.
-- If you cannot find the answer after thorough searching, say so.
-- Always search at least once before attempting to answer."""
+Otherwise, call a tool to search or read more."""
 
 
-def extract_answer_from_text(text: str) -> str:
-    """Extract the Exact Answer from the model's final response."""
-    # Try to find "Exact Answer:" pattern
+def extract_answer(text: str) -> str:
+    """Extract Exact Answer from model output."""
     match = re.search(r'Exact Answer:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-    # Fallback: return the whole text
-    return text.strip()
+    return match.group(1).strip() if match else text.strip()
 
 
-def execute_tool_call(
-    tool_call: Dict[str, Any],
-    registry: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Execute a single tool call and return the result."""
-    function = tool_call.get("function", {})
-    name = function.get("name", "")
-    arguments = function.get("arguments", "{}")
-    if isinstance(arguments, str):
-        arguments = json.loads(arguments)
-    result = registry[name](**arguments)
-    return result
-
-
-def truncate_tool_content(content: Any, max_chars: int = 3000) -> str:
-    """Truncate tool content to avoid blowing the context window."""
+def truncate_content(content: Any, max_chars: int = 2000) -> str:
+    """Truncate tool results to keep context lean."""
     text = json.dumps(content, ensure_ascii=False) if not isinstance(content, str) else content
     if len(text) <= max_chars:
         return text
-    return text[:max_chars] + f"\n... [truncated from {len(text)} total chars]"
+    return text[:max_chars] + f"\n... [truncated {len(text) - max_chars} chars]"
+
+
+class SimpleTracker:
+    """Lightweight tracker — no LLM calls, just dedup and status."""
+
+    def __init__(self):
+        self.all_visited_docids: set = set()
+        self.round_docids: List[set] = []          # docids per round
+        self.seen_queries: set = set()
+        self.last_round_no_new_docs: bool = False
+
+    def record_search(self, query: str, results: List[Dict]) -> bool:
+        """Returns True if any NEW doc was found."""
+        self.seen_queries.add(query.lower().strip())
+        new_docids = {d["docid"] for d in results if d["docid"] not in self.all_visited_docids}
+        self.all_visited_docids.update(new_docids)
+        return len(new_docids) > 0
+
+    def record_round(self, round_docids: set):
+        self.round_docids.append(round_docids)
+        if len(self.round_docids) >= 2:
+            prev = self.round_docids[-2]
+            curr = self.round_docids[-1]
+            self.last_round_no_new_docs = curr.issubset(prev)
+
+    @property
+    def should_stop(self) -> bool:
+        """Stop if 2 consecutive rounds found no new documents."""
+        if len(self.round_docids) < 3:
+            return False
+        return self.last_round_no_new_docs
+
+    def is_duplicate_query(self, query: str) -> bool:
+        return query.lower().strip() in self.seen_queries
+
+
+def compress_old_rounds(messages: List[Dict], tracker: SimpleTracker) -> List[Dict]:
+    """Keep system + question + last 4 rounds of conversation; drop the middle."""
+    # Find the boundaries: system message + user question
+    keep = messages[:2]  # system + question
+
+    # Collect key facts from tracker
+    if tracker.all_visited_docids:
+        fact_line = f"[Session: searched {len(tracker.seen_queries)} queries, examined {len(tracker.all_visited_docids)} documents]"
+        keep.append({"role": "user", "content": fact_line + "\nContinue from where you left off. What do you still need to find?"})
+
+    # Keep the last 6 messages (≈ 2–3 rounds of back-and-forth)
+    tail = messages[-6:] if len(messages) > 6 else messages[2:]
+    keep.extend(tail)
+    return keep
 
 
 class DeepResearchAgent:
-    """Multi-turn ReAct agent for deep research on BrowseComp-Plus."""
+    """Multi-turn ReAct agent with smart stop conditions and context management."""
 
     def __init__(
         self,
@@ -104,7 +122,7 @@ class DeepResearchAgent:
         searcher: Any,
         model_name: str = "qwen_auto",
         max_rounds: int = 8,
-        max_tokens: int = 2048,
+        max_tokens: int = 4096,
         top_k: int = 10,
         temperature: float = 0.0,
         system_prompt: Optional[str] = None,
@@ -119,33 +137,29 @@ class DeepResearchAgent:
         self.system_prompt = system_prompt or SYSTEM_PROMPT
 
         tool_specs, tool_registry = get_agent_tool_specs_and_registry(
-            searcher=self.searcher,
-            k=self.top_k,
-            snippet_max_chars=1500,
+            searcher=self.searcher, k=self.top_k, snippet_max_chars=1500,
         )
         self.tool_specs = tool_specs
         self.tool_registry = tool_registry
 
     def solve(self, question: str, query_id: Optional[str] = None) -> Dict[str, Any]:
-        """Run the agent on a single question.
+        tracker = SimpleTracker()
 
-        Returns a dict with keys:
-            - query_id
-            - question
-            - predicted_answer
-            - status
-            - messages (full conversation trajectory)
-            - num_tool_calls
-        """
-        messages: List[Dict[str, Any]] = [
+        messages: List[Dict] = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": question},
         ]
 
         num_tool_calls = 0
-        final_status = "completed"
+        compress_done = False
 
         for round_idx in range(1, self.max_rounds + 1):
+            # ── Context compression (once, after round 4) ──
+            if round_idx == 5 and not compress_done:
+                messages = compress_old_rounds(messages, tracker)
+                compress_done = True
+
+            # ── Call vLLM ──
             response = self.client.simple_chat(
                 model=self.model_name,
                 messages=messages,
@@ -160,35 +174,48 @@ class DeepResearchAgent:
             content = message.get("content") or ""
             tool_calls = message.get("tool_calls") or []
 
-            # Build assistant message
             assistant_msg = {"role": "assistant", "content": content}
             if tool_calls:
                 assistant_msg["tool_calls"] = tool_calls
             messages.append(assistant_msg)
 
-            # No tool calls -> final answer
+            # ── Model decided to answer directly ──
             if not tool_calls:
-                final_answer = content
                 return {
                     "query_id": query_id,
                     "question": question,
-                    "predicted_answer": extract_answer_from_text(final_answer),
+                    "predicted_answer": extract_answer(content),
                     "status": "completed",
                     "messages": messages,
                     "num_tool_calls": num_tool_calls,
                     "rounds_used": round_idx,
                 }
 
-            # Execute tool calls
+            # ── Execute tool calls ──
+            round_docids = set()
             for tc in tool_calls:
                 num_tool_calls += 1
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                args = json.loads(fn.get("arguments", "{}"))
                 try:
-                    result = execute_tool_call(tc, self.tool_registry)
-                    truncated = truncate_tool_content(result, max_chars=3000)
+                    result = self.tool_registry[name](**args)
+
+                    if name == "search":
+                        query = args.get("query", "")
+                        has_new = tracker.record_search(query, result)
+                        for d in result:
+                            round_docids.add(d["docid"])
+
+                    elif name == "get_document":
+                        docid = args.get("docid", "")
+                        round_docids.add(docid)
+
+                    truncated = truncate_content(result)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "content": truncated if isinstance(truncated, str) else json.dumps(truncated, ensure_ascii=False),
+                        "content": truncated,
                     })
                 except Exception as e:
                     messages.append({
@@ -197,15 +224,35 @@ class DeepResearchAgent:
                         "content": json.dumps({"error": str(e)}),
                     })
 
-        # Max rounds reached without final answer
-        # Force the model to answer
+            # ── Track round results and check stop condition ──
+            tracker.record_round(round_docids)
+            if tracker.should_stop and round_idx >= 3:
+                messages.append({
+                    "role": "user",
+                    "content": "Your last 2 searches returned no new documents. Please give your Best Guess answer now.\n\nFormat:\nExplanation: <reasoning>\nExact Answer: <answer>\nConfidence: low",
+                })
+                response = self.client.simple_chat(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
+                final = response["choices"][0]["message"]["content"]
+                messages.append({"role": "assistant", "content": final})
+                return {
+                    "query_id": query_id,
+                    "question": question,
+                    "predicted_answer": extract_answer(final),
+                    "status": "no_new_info",
+                    "messages": messages,
+                    "num_tool_calls": num_tool_calls,
+                    "rounds_used": round_idx,
+                }
+
+        # ── Max rounds — force answer ──
         messages.append({
             "role": "user",
-            "content": (
-                "You have reached the maximum number of search rounds. "
-                "Please provide your best answer based on the evidence gathered so far. "
-                "Format:\nExplanation: <brief>\nExact Answer: <answer>\nConfidence: <percentage>%"
-            ),
+            "content": "Maximum rounds reached. Give your Best Guess answer now.\n\nFormat:\nExplanation: <reasoning>\nExact Answer: <answer>\nConfidence: low",
         })
         response = self.client.simple_chat(
             model=self.model_name,
@@ -213,13 +260,12 @@ class DeepResearchAgent:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
-        final_answer = response["choices"][0]["message"]["content"]
-        messages.append({"role": "assistant", "content": final_answer})
-
+        final = response["choices"][0]["message"]["content"]
+        messages.append({"role": "assistant", "content": final})
         return {
             "query_id": query_id,
             "question": question,
-            "predicted_answer": extract_answer_from_text(final_answer),
+            "predicted_answer": extract_answer(final),
             "status": "max_rounds_reached",
             "messages": messages,
             "num_tool_calls": num_tool_calls,
@@ -233,34 +279,25 @@ def batch_solve(
     output_path: str,
     verbose: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Run agent on a batch of questions and save results."""
+    """Run agent on batch and save results."""
     records = []
     for i, row in enumerate(questions):
         query_id = row.get("query_id", f"q{i}")
         question = row.get("query", row.get("question", ""))
         if not question:
             continue
-
         if verbose:
-            print(f"[{i + 1}/{len(questions)}] query_id={query_id}...", end=" ", flush=True)
-
+            print(f"[{i+1}/{len(questions)}] q={query_id}...", end=" ", flush=True)
         t0 = time.time()
         result = agent.solve(question=question, query_id=query_id)
         elapsed = time.time() - t0
-
         if verbose:
-            ans_preview = result["predicted_answer"][:60]
-            print(f"rounds={result['rounds_used']} tc={result['num_tool_calls']} "
-                  f"ans={ans_preview}... ({elapsed:.1f}s)")
-
+            print(f"r={result['rounds_used']} tc={result['num_tool_calls']} ans={result['predicted_answer'][:60]}... ({elapsed:.1f}s)")
         records.append(result)
 
-    # Save to file
     with open(output_path, "w", encoding="utf-8") as f:
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
     if verbose:
         print(f"\nSaved {len(records)} results to {output_path}")
-
     return records
