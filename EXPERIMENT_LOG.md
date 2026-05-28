@@ -168,3 +168,27 @@
 - Plan 4: 保证前 3 轮专注于证据收集
 
 **待验证：** hard50 全量评估
+
+## V1 五项改进 — 首次评估失败 (2026-05-29)
+
+| 项目 | 值 |
+|------|-----|
+| 版本 | Plan 1-5 全部启用 (search_phase=3, verify-3000char, no safe valve) |
+| 模型 | Qwen3-8B |
+| 结果 | 跑 12 题后 HTTP 400 崩溃 (上下文溢出) |
+| 平均工具调用 | **~11/题** (从 4.96 暴涨) |
+| 平均单题耗时 | **~130s** (从 ~30s 暴涨) |
+| 回答模式 | 大量 "cannot be answered" / "not supported by evidence" |
+
+**失败根因：**
+
+1. **Plan 4 搜索阶段太长 (3轮)**：第 1-3 轮强制 `tool_choice="required"`，模型想读文档也被迫搜索，浪费轮次
+2. **Plan 5 验证只读 3000 字符**：`verify_claim()` 只取 `text[:3000]`，答案在文档后半段时验证总返回 NO，模型被逼继续搜直到 max_rounds
+3. **最后无兜底**：第 7-8 轮验证还不过 → "cannot be answered"，不敢猜
+4. **上下文爆炸**：11 次工具调用 × 8 轮 → 远超 Qwen3-8B 的 32K 上下文 → HTTP 400
+
+**修复 (commit 90f623d):**
+- `search_phase_max_round 3→1`：只有第 1 轮强制工具
+- `verify_claim` 全文搜索：提取 claim 关键词定位全文档，不只读 3000 字符
+- 最后轮 safe valve：`round_idx < max_rounds-1` 才验证，最后 1 轮直接答
+- 预期 tc 从 ~11 降回 ~5-6，预计准确率回到 12%+ 基线
