@@ -15,6 +15,9 @@ from .vllm_client import VLLMClient
 
 SYSTEM_PROMPT = """You are a Deep Research Agent. Your task is to search a document corpus to answer complex questions by gathering evidence across multiple rounds.
 
+## CRITICAL RULE
+You MUST call search() at least once before giving any answer. Never answer from your training data — the correct answer is in the document corpus.
+
 ## Available Tools
 
 - **search(query: str)** — Search the corpus. Returns top-10 document snippets with docid and score.
@@ -171,6 +174,9 @@ class DeepResearchAgent:
                 messages = compress_old_rounds(messages, tracker)
                 compress_done = True
 
+            # ── Force tool use on round 1 (model tends to answer from memory) ──
+            tool_choice = "required" if round_idx == 1 else "auto"
+
             # ── Call vLLM ──
             response = self.client.simple_chat(
                 model=self.model_name,
@@ -178,7 +184,7 @@ class DeepResearchAgent:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 tools=self.tool_specs,
-                tool_choice="auto",
+                tool_choice=tool_choice,
             )
 
             choice = response["choices"][0]

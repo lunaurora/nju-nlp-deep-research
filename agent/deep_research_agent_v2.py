@@ -389,6 +389,9 @@ def extract_answer(text: str) -> str:
 
 V2_SYSTEM_PROMPT = """You are a Deep Research Agent. Your task is to search a document corpus to answer complex questions by gathering evidence across multiple rounds.
 
+## CRITICAL RULE
+You MUST call search() at least once before giving any answer. Never answer from your training data — the correct answer is in the document corpus.
+
 ## Available Tools
 
 - **search(query: str)** — Search the corpus. Returns top document snippets with docid and score.
@@ -553,14 +556,15 @@ class DeepResearchAgentV2:
                     "content": f"[Status Update]\n{tracker.get_status_summary()}\n\nContinue searching if you still need more evidence.",
                 })
 
-            # --- Call vLLM with tool choice auto ──
+            # --- Call vLLM with tool choice (force on round 1) ---
+            tool_choice = "required" if round_idx == 1 else "auto"
             response = self.client.simple_chat(
                 model=self.model_name,
                 messages=messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 tools=self.tool_specs,
-                tool_choice="auto",
+                tool_choice=tool_choice,
             )
 
             choice = response["choices"][0]
