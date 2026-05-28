@@ -27,11 +27,11 @@ Confidence: <high|medium|low>
 
 ## Available Tools
 
-- **search(query)** — Search the corpus. Returns snippets with docid and score.
+- **search(query)** — Search the corpus (uses BM25 keyword matching; queries auto-optimized for concrete keyword extraction, so use natural language freely).
 - **get_document(docid)** — Read a full document by its docid.
 - **find_in_doc(docid, keyword)** — Search within a document for a keyword.
-- **decompose_question(question)** — [Advanced] Break a complex question into sub-queries.
-- **verify_claim(claim, docids)** — [Advanced] Verify a candidate answer against specific documents.
+- **decompose_question(question)** — Break a complex question into sub-queries (auto-called at start).
+- **verify_claim(claim, docids)** — Verify a candidate answer against specific documents.
 
 ## CRITICAL RULES
 1. NEVER answer without reading at least 2 full documents first.
@@ -62,7 +62,7 @@ class SimpleTracker:
         self.all_visited_docids: set = set()
         self.round_docids: List[set] = []          # docids per round
         self.seen_queries: set = set()
-        self.last_round_no_new_docs: bool = False
+        self.consecutive_no_new_docs: int = 0
 
     def record_search(self, query: str, results: List[Dict]) -> bool:
         """Returns True if any NEW doc was found."""
@@ -76,17 +76,28 @@ class SimpleTracker:
         if len(self.round_docids) >= 2:
             prev = self.round_docids[-2]
             curr = self.round_docids[-1]
-            self.last_round_no_new_docs = curr.issubset(prev)
+            if curr.issubset(prev):
+                self.consecutive_no_new_docs += 1
+            else:
+                self.consecutive_no_new_docs = 0
 
     @property
     def should_stop(self) -> bool:
-        """Stop if 2 consecutive rounds found no new documents."""
-        if len(self.round_docids) < 3:
-            return False
-        return self.last_round_no_new_docs
+        """Stop after 3 consecutive rounds with no new documents."""
+        return self.consecutive_no_new_docs >= 3
 
     def is_duplicate_query(self, query: str) -> bool:
-        return query.lower().strip() in self.seen_queries
+        """Check if query is a duplicate via token overlap (Jaccard > 80%)."""
+        query_tokens = set(query.lower().split())
+        if not query_tokens:
+            return False
+        for seen in self.seen_queries:
+            seen_tokens = set(seen.split())
+            intersection = query_tokens & seen_tokens
+            union = query_tokens | seen_tokens
+            if intersection and len(intersection) / len(union) > 0.8:
+                return True
+        return False
 
 
 def compress_old_rounds(messages: List[Dict], tracker: SimpleTracker) -> List[Dict]:
@@ -156,7 +167,9 @@ class DeepResearchAgent:
 
         num_tool_calls = 0
         compress_done = False
-        doc_read_forced = False
+        unique_docs_read: set = set()
+        max_docs_to_read = 3
+        auto_loaded_top1 = False
         verify_forced = False
 
         for round_idx in range(1, self.max_rounds + 1):
@@ -253,12 +266,35 @@ class DeepResearchAgent:
                     if name == "search":
                         query = args.get("query", "")
                         has_new = tracker.record_search(query, result)
+
+                        # Search dedup warning
+                        if tracker.is_duplicate_query(query) and round_idx > 1:
+                            messages.append({
+                                "role": "user",
+                                "content": "Note: This query closely overlaps with a previous one. Try a different search angle or read a document you haven't examined yet."
+                            })
+
                         for d in result:
                             round_docids.add(d["docid"])
+
+                        # Auto-load top-1 full text after first search
+                        if result and not auto_loaded_top1:
+                            auto_loaded_top1 = True
+                            top_docid = result[0]["docid"]
+                            top_doc = self.searcher.get_document(top_docid)
+                            if top_doc:
+                                unique_docs_read.add(top_docid)
+                                round_docids.add(top_docid)
+                                full_text = top_doc.get("text", "")
+                                messages.append({
+                                    "role": "user",
+                                    "content": f"[Auto-loaded full text of top result {top_docid}]:\n{full_text[:3000]}"
+                                })
 
                     elif name == "get_document":
                         docid = args.get("docid", "")
                         round_docids.add(docid)
+                        unique_docs_read.add(docid)
 
                     truncated = truncate_content(result)
                     messages.append({
@@ -273,22 +309,24 @@ class DeepResearchAgent:
                         "content": json.dumps({"error": str(e)}),
                     })
 
-            # ── Force get_document (once) if model searches but never reads ──
+            # ── Force get_document if model searches but hasn't read enough unique docs ──
             _just_forced_read = False
-            if round_has_search and not round_has_getdoc and not doc_read_forced and round_docids:
-                doc_read_forced = True
-                _just_forced_read = True
-                messages.append({
-                    "role": "user",
-                    "content": "CRITICAL: You must call get_document() now on the most relevant docid to read the full text. Snippets are not sufficient evidence — you must read the complete document."
-                })
+            if round_has_search and not round_has_getdoc and round_docids and round_idx >= 2:
+                if len(unique_docs_read) < max_docs_to_read:
+                    _just_forced_read = True
+                    unread = [d for d in round_docids if d not in unique_docs_read]
+                    target = unread[0] if unread else list(round_docids)[0]
+                    messages.append({
+                        "role": "user",
+                        "content": f"CRITICAL: You have only read {len(unique_docs_read)}/{max_docs_to_read} documents so far. Call get_document('{target}') to read the full text. Snippets are not sufficient evidence."
+                    })
 
             # ── Track round results and check stop condition ──
             tracker.record_round(round_docids)
             if tracker.should_stop and round_idx >= 3 and not round_has_getdoc and not _just_forced_read:
                 messages.append({
                     "role": "user",
-                    "content": "Your last 2 searches returned no new documents. Please give your Best Guess answer now.\n\nFormat:\nExplanation: <reasoning>\nExact Answer: <answer>\nConfidence: low",
+                    "content": "Your last 3 rounds found no new documents. Please give your Best Guess answer now.\n\nFormat:\nExplanation: <reasoning>\nExact Answer: <answer>\nConfidence: low",
                 })
                 response = self.client.simple_chat(
                     model=self.model_name,

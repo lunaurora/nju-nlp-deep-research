@@ -42,6 +42,43 @@ def format_rag_context(results: List[Dict[str, Any]]) -> str:
     return "\n\n".join(blocks)
 
 
+def _rewrite_for_bm25(natural_query: str, client: Optional[Any], model_name: str) -> str:
+    """Rewrite natural language query into BM25-friendly keywords via LLM."""
+    if client is None:
+        return natural_query
+    prompt = (
+        "Extract 2-4 specific keywords for BM25 keyword search.\n"
+        "Rules:\n"
+        "- Keep ONLY: named entities, dates, numbers, unique terms\n"
+        "- Remove vague words: about, certain, something, related\n"
+        "- Output one line of space-separated keywords\n"
+        "- No explanations, no numbering\n\n"
+        "Examples:\n"
+        "  barrel-shaped floating vessel mentioned in a book\n"
+        "  -> barrel-shaped floating vessel\n\n"
+        "  a company with 35 employees as of Dec 31 2022\n"
+        "  -> 35 employees December 31 2022\n\n"
+        "  book published in 1920s about inland discoveries\n"
+        "  -> 1920s inland discoveries"
+    )
+    try:
+        resp = client.simple_chat(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": "You extract concrete keywords for BM25 search. Output only the keywords, no explanation."},
+                {"role": "user", "content": natural_query},
+            ],
+            temperature=0.0,
+            max_tokens=128,
+        )
+        rewritten = resp["choices"][0]["message"]["content"].strip()
+        if rewritten and len(rewritten) > 3 and rewritten != natural_query:
+            return rewritten
+    except Exception:
+        pass
+    return natural_query
+
+
 def get_search_tool_specs_and_registry(
     searcher: BrowseCompBM25Searcher,
     k: int = 5,
@@ -80,7 +117,8 @@ def get_agent_tool_specs_and_registry(
     model_name: str = "qwen_auto",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Callable[..., Any]]]:
     def search(query: str) -> List[Dict[str, Any]]:
-        return retrieve_once(searcher=searcher, query=query, k=k, snippet_max_chars=snippet_max_chars)
+        optimized = _rewrite_for_bm25(query, client, model_name)
+        return retrieve_once(searcher=searcher, query=optimized, k=k, snippet_max_chars=snippet_max_chars)
 
     def get_document(docid: str) -> Dict[str, Any]:
         doc = searcher.get_document(docid)
@@ -111,12 +149,13 @@ def get_agent_tool_specs_and_registry(
                 "name": "search",
                 "description": (
                     f"Search the corpus and return top-{k} snippets with docid, score. "
-                    "After finding a relevant snippet, call get_document() to read the full text."
+                    "Note: queries are automatically optimized for BM25 keyword matching. "
+                    "You can use natural language descriptions — the system extracts concrete keywords."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "Search query with specific keywords (names, dates, entities)"},
+                        "query": {"type": "string", "description": "Search query — use natural language, the system auto-extracts BM25-friendly keywords"},
                     },
                     "required": ["query"],
                 },

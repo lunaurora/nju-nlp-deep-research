@@ -192,6 +192,45 @@ source ~/.bashrc
 claude
 ```
 
+## 关键创新点
+
+### BM25 Query Rewriting（自然语言→关键词改写）
+**问题:** BrowseComp-Plus 的问题用自然语言描述，但 BM25 是纯关键词匹配，拿 "a book about certain inland discoveries" 这种模糊描述去搜基本召回不到相关文档。
+
+**方案:** 在 `search()` 工具内部加了一层 LLM 改写。模型可以用自然语言写 query，工具自动提取具体实体（人名、日期、数字、独特术语），去掉模糊词（about, certain, something），输出 BM25 友好的关键词组合。
+
+例如 q442 的查询：
+```
+模型输入 query: "a book about certain inland discoveries in the 1920s"
+改写后实际检索: "1920s inland discoveries"
+```
+
+或者用问题里的具体细节直接撞:
+```
+模型输入 query: "a description of a barrel-shaped floating vessel on page 332-339"
+改写后实际检索: "barrel-shaped floating vessel 332-339"
+```
+
+这解决了 BM25 的第一跳召回问题，让相关文档有机会进入 top-10。改写在 `tools.py` 的 `_rewrite_for_bm25()` 实现，对模型透明，无需修改 agent loop。
+
+### 强制读全文机制
+模型搜到 snippet 后常直接猜答案。Agent 在检测到模型连续搜了 2 次不读全文时，自动插入 user message 强制调用 `get_document()`。
+
+### 自动拆题 + 回答前验证
+Loop 开始前自动调 `decompose_question()` 将复杂问题拆成子查询；模型想回答时先强制 `verify_claim()` 核对证据。
+
+### 自动加载 top-1 全文
+首次搜索后自动调用 `get_document()` 获取排名第一文档的完整文本（前 3000 字符），直接注入到 conversation。解决模型只看 snippet 就猜答案的 hallucination 问题。
+
+### 三次强制读文档
+模型搜索后不调用 `get_document()` 时，agent 自动插入提示要求读全文。`unique_docs_read` 集合跟踪已读文档 ID，`max_docs_to_read=3` 控制目标，重复引导直到模型读完足够文档。
+
+### 搜索去重（Token 重叠检测）
+`SimpleTracker.is_duplicate_query()` 使用 Jaccard token 重叠度 > 80% 检测近似重复查询，命中时给出提示，减少 BM25 无效检索。
+
+### 停止条件放宽
+原停止逻辑实质是"任意 1 轮无新文档即停"。改为连续 3 轮无新文档才触发，给模型更多搜索空间。实现：`SimpleTracker.consecutive_no_new_docs` 计数器。
+
 ## 评估
 
 - 自动评估: `agent/eval.py` 或 notebook cell 5
@@ -208,6 +247,10 @@ claude
 - [x] tool_choice="required" 对 Qwen3 不够，已加 retry 机制
 - [x] 新增 decompose_question + verify_claim 两个高级工具
 - [x] 重写 system prompt：强制读全文、至少搜2次、禁止 <think> 在答案中
+- [x] 自动 top-1 全文加载：首次搜索后自动注入 top 文档全文
+- [x] 停止条件放宽：1轮→3轮连续无新文档
+- [x] 多次强制读：1次→最多3次强制 get_document
+- [x] 搜索去重：Jaccard token 重叠 > 80% 检测
 - [ ] 验证改进后 hard50 准确率
 - [ ] V2 修复或重构
 - [ ] 消融实验

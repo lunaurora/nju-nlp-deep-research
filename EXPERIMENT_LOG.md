@@ -77,3 +77,29 @@
 5. `deep_research_agent.py`: snippet_max_chars 1500→800，逼模型读全文
 6. `deep_research_agent.py`: 停止条件加 `not round_has_getdoc` 保护（刚读了文档就不停）
 7. `EXPERIMENT_LOG.md`: 新增本条目
+
+## V1 四项改进：自动读 top-1 / 放宽停止 / 多次强制读 / 搜索去重 (2026-05-28)
+
+| 项目 | 值 |
+|------|-----|
+| 版本 | V1 + 自动 top-1 全文 + 3 轮停止 + 多次强制读 + 搜索去重 |
+| 模型 | Qwen3-8B |
+| 状态 | 代码完成，待 hard50 评估 |
+| 备注 | 4 项非冲突改进全部实现 |
+
+**改动清单：**
+
+1. **自动加载 top-1 全文** — 首次 search() 后自动调 get_document() 获取 top-1 文档全文（前 3000 字符）并注入到 conversation，模型无需手动调用即可看到完整文本。解决 98% hallucination from snippet 的问题。
+
+2. **停止条件放宽到 3 轮** — 原 stop 条件实质是"任意 1 轮无新文档就停"，过于激进。改为连续 3 轮无新文档才触发停止，给模型更多搜索空间。实现：`SimpleTracker.consecutive_no_new_docs` 计数器，每轮比较 docid 集合 subset 关系，累加连续轮数。
+
+3. **多次强制读文档** — 原 `doc_read_forced` 是二值 flag（只强制 1 次）。改为 `unique_docs_read` 集合 + `max_docs_to_read=3`，模型搜了不读时重复强制，直到读完 3 篇不同文档。
+
+4. **搜索去重** — `is_duplicate_query()` 从精确字符串匹配升级为 Jaccard token 重叠度 > 80% 检测。命中时插入 user message 提示换搜索角度。减少 BM25 重复检索的浪费。
+
+**预期收益与风险：**
+- 收益：模型读全文增多 → hallucination 减少；停止更宽松 → 更多搜索轮次
+- 风险：自动加载 top-1 可能误导（top-1 不一定是相关文档）；停止放宽 → 更长推理时间；多次强制读可能打乱模型节奏
+
+**改动的文件：**
+- `agent/deep_research_agent.py` — SimpleTracker 重写 + solve() 方法扩展
