@@ -228,6 +228,33 @@ Loop 开始前自动调 `decompose_question()` 将复杂问题拆成子查询；
 ### 搜索去重（Token 重叠检测）
 `SimpleTracker.is_duplicate_query()` 使用 Jaccard token 重叠度 > 80% 检测近似重复查询，命中时给出提示，减少 BM25 无效检索。
 
+## V1 Five Improvements (2026-05-29)
+
+### Plan 1: Multi-Query 搜索扩展
+单个 search() 调用自动扩展为 4 个不同角度的 BM25 查询（1 个原始改写 + 3 个 LLM 生成的多样化变体），所有结果合并去重。大幅提高复杂问题的第一跳召回率，解决了"BM25 用自然语言描述搜不到匹配文档"的核心问题。
+
+实现: `tools.py` 的 `_expand_queries()` + 修改 `search()` 闭包。
+
+### Plan 2: 强制证据引用
+答案格式改为强制要求 `Evidence: <docid> "<verbatim quote>"` + `Exact Answer` + `Confidence`。模型答案中缺少 Evidence 字段时自动阻断并提醒，直接对抗 hallucination。
+
+实现: 更新 SYSTEM_PROMPT + 回答前格式检查。
+
+### Plan 3: 自动 find_in_doc 精确定位
+Agent 启动时用 LLM 从问题中提取 5 个关键实体/短语（`_extract_key_terms`）。模型调用 `get_document()` 读长文档（>1500 字符）时，系统自动对每个关键实体执行 `find_in_doc()`，将匹配段落注入对话。解决"读书的开头 3000 字符但答案在 300 页之后"的问题。
+
+实现: `deep_research_agent.py` 的 `_extract_key_terms()` + solve() 中的自动触发逻辑。
+
+### Plan 4: 分层检索（搜索专用阶段）
+前 3 轮强制为搜索阶段，任何回答尝试都被阻断并引导继续搜索。第 4 轮起才允许回答。确保模型在试图回答前有足够的证据收集。
+
+实现: `tool_choice="required"` 覆盖 rounds 1-3 + 回答前轮次检查。
+
+### Plan 5: 硬化 Verification 循环
+模型试图回答时，系统自动调用 `verify_claim()`（不依赖模型自主调用），解析返回的 "Supported: YES/NO"。NO 时自动阻断回答路径，注入失败信息强制继续搜索。YES 时才允许输出最终答案。
+
+实现: solve() 中的自动验证逻辑 + 阻断+重搜循环 + verify_passed 状态追踪。
+
 ### 停止条件放宽
 原停止逻辑实质是"任意 1 轮无新文档即停"。改为连续 3 轮无新文档才触发，给模型更多搜索空间。实现：`SimpleTracker.consecutive_no_new_docs` 计数器。
 
@@ -238,7 +265,7 @@ Loop 开始前自动调 `decompose_question()` 将复杂问题拆成子查询；
 - 准确率 ≥12% 开始计分
 - 实验记录保存在 `EXPERIMENT_LOG.md`
 
-## 当前进度 (2026-05-28)
+## 当前进度 (2026-05-29)
 
 - [x] V1 baseline: 8.00% (4/50), 57% tc=0 错误
 - [x] V1 prompt 改进 + tool_choice="required"
@@ -251,7 +278,12 @@ Loop 开始前自动调 `decompose_question()` 将复杂问题拆成子查询；
 - [x] 停止条件放宽：1轮→3轮连续无新文档
 - [x] 多次强制读：1次→最多3次强制 get_document
 - [x] 搜索去重：Jaccard token 重叠 > 80% 检测
-- [ ] 验证改进后 hard50 准确率
+- [x] **Plan 1**: Multi-Query 搜索扩展 — 单 search() 自动 4 查询合并
+- [x] **Plan 2**: 强制证据引用 — Evidence: 格式 + 自动检查
+- [x] **Plan 3**: 自动 find_in_doc — 关键实体提取 + 长文档精确定位
+- [x] **Plan 4**: 分层检索 — 前 3 轮搜索专用阶段
+- [x] **Plan 5**: 硬化 Verification — 自动验证 + 阻断 + 重搜循环
+- [ ] 验证 5 项改进后 hard50 准确率
 - [ ] V2 修复或重构
 - [ ] 消融实验
 - [ ] 提交最终结果

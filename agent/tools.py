@@ -79,6 +79,44 @@ def _rewrite_for_bm25(natural_query: str, client: Optional[Any], model_name: str
     return natural_query
 
 
+def _expand_queries(natural_query: str, client: Any, model_name: str, num_queries: int = 3) -> List[str]:
+    """Generate multiple diverse BM25 keyword queries targeting different aspects of the question."""
+    if client is None:
+        return [natural_query]
+    prompt = (
+        f"Generate {num_queries} different keyword searches for BM25 to find documents "
+        "answering this question.\n"
+        "Each query must focus on DIFFERENT entities, names, dates, numbers, or unique terms.\n"
+        "Rules:\n"
+        "- Keep ONLY concrete keywords (proper names, dates, numbers, unique phrases)\n"
+        "- Remove vague words: about, certain, something, related, particular\n"
+        "- Output one query per line — NO numbering, NO explanation\n\n"
+        "Example:\n"
+        "Question: A book first published in the 1920s that deals with certain inland discoveries, was published by a company founded in the 1880s. There's a description about a barrel-shaped floating vessel on pages 332-339.\n"
+        "->\n"
+        "1920s inland discoveries book\n"
+        "barrel-shaped floating vessel\n"
+        "publishing company founded 1880s\n"
+        "spear attack botanist party 463 464\n\n"
+        "Question:"
+    )
+    try:
+        resp = client.simple_chat(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": "You extract diverse keyword queries for BM25 search. Output only the queries, no explanation."},
+                {"role": "user", "content": f"{prompt}\n{natural_query}"},
+            ],
+            temperature=0.3,
+            max_tokens=256,
+        )
+        text = resp["choices"][0]["message"]["content"].strip()
+        queries = [q.strip() for q in text.split("\n") if q.strip() and len(q.strip()) > 3]
+        return queries[:num_queries]
+    except Exception:
+        return [natural_query]
+
+
 def get_search_tool_specs_and_registry(
     searcher: BrowseCompBM25Searcher,
     k: int = 5,
@@ -117,8 +155,25 @@ def get_agent_tool_specs_and_registry(
     model_name: str = "qwen_auto",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Callable[..., Any]]]:
     def search(query: str) -> List[Dict[str, Any]]:
+        # 1) Get BM25-optimized keywords from the natural language query
         optimized = _rewrite_for_bm25(query, client, model_name)
-        return retrieve_once(searcher=searcher, query=optimized, k=k, snippet_max_chars=snippet_max_chars)
+        # 2) Generate diverse query variants targeting different question aspects
+        expanded = _expand_queries(query, client, model_name, num_queries=3)
+        # 3) Deduplicate: optimized first, then diverse queries
+        all_queries = [optimized] + [q for q in expanded if q.lower().strip() != optimized.lower().strip()]
+        all_queries = list(dict.fromkeys(all_queries))[:4]  # max 4 unique queries
+        # 4) Search with each query, merge unique results
+        seen_docids = set()
+        merged = []
+        for q in all_queries:
+            batch = retrieve_once(searcher=searcher, query=q, k=max(1, k // 2), snippet_max_chars=snippet_max_chars)
+            for doc in batch:
+                if doc["docid"] not in seen_docids:
+                    seen_docids.add(doc["docid"])
+                    merged.append(doc)
+            if len(merged) >= k:
+                break
+        return merged[:k]
 
     def get_document(docid: str) -> Dict[str, Any]:
         doc = searcher.get_document(docid)

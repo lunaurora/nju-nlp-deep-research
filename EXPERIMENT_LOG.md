@@ -63,6 +63,7 @@
 | 准确率 | **6.00%** (3/50) |
 | 平均工具调用 | 3.22 |
 | 平均检索文档 | 0.12 |
+| 笔记文件 | runs_archive/0528_首次强制读/agent_vllm_deep_research.ipynb |
 | 备注 | retry 解决了 tc=0，但模型仍然不读全文，98% 靠 snippet 猜答案 |
 
 **错误模式：**
@@ -78,28 +79,92 @@
 6. `deep_research_agent.py`: 停止条件加 `not round_has_getdoc` 保护（刚读了文档就不停）
 7. `EXPERIMENT_LOG.md`: 新增本条目
 
-## V1 四项改进：自动读 top-1 / 放宽停止 / 多次强制读 / 搜索去重 (2026-05-28)
+## V1 四项改进评估 — hard50 (2026-05-28 10:46)
 
 | 项目 | 值 |
 |------|-----|
 | 版本 | V1 + 自动 top-1 全文 + 3 轮停止 + 多次强制读 + 搜索去重 |
 | 模型 | Qwen3-8B |
-| 状态 | 代码完成，待 hard50 评估 |
-| 备注 | 4 项非冲突改进全部实现 |
+| 数据集 | hard50 |
+| 准确率 | **12.00% (6/50)** |
+| 平均工具调用 | 4.96 |
+| 平均检索文档 | 0.24 |
+| 评估文件 | runs/eval_results_0528_1046.jsonl |
+| 笔记文件 | runs_archive/0528_1046/agent_vllm_deep_research.ipynb |
 
-**改动清单：**
+**与历史对比：**
 
-1. **自动加载 top-1 全文** — 首次 search() 后自动调 get_document() 获取 top-1 文档全文（前 3000 字符）并注入到 conversation，模型无需手动调用即可看到完整文本。解决 98% hallucination from snippet 的问题。
+| 轮次 | 准确率 | tc/query | docs/query | hallucination |
+|------|--------|----------|------------|---------------|
+| Baseline | 8.00% | 1.24 | 0.02 | 43% |
+| +retry+高级工具 | 6.00% | 1.96 | 0.02 | 49% |
+| +强制读+拆分+验证 | 6.00% | 3.22 | 0.12 | 98% |
+| +top-1全文+宽松停止+多次强读+去重 | **12.00%** | **4.96** | **0.24** | **95%** |
 
-2. **停止条件放宽到 3 轮** — 原 stop 条件实质是"任意 1 轮无新文档就停"，过于激进。改为连续 3 轮无新文档才触发停止，给模型更多搜索空间。实现：`SimpleTracker.consecutive_no_new_docs` 计数器，每轮比较 docid 集合 subset 关系，累加连续轮数。
+**分析：**
+- **四项改进整体有效**，准确率从 6% 翻倍到 12%，刚好过及格线
+- **工具调用显著增加**（3.22→4.96），模型更积极搜索了
+- **检索文档仍然极低（0.24）**：即使自动注入 top-1 全文 + 最多 3 次强制读，模型还是倾向从 snippet 猜答案，不读完整文档
+- **95% 错误仍是 hallucination**：核心问题不变——模型凭训练数据记忆回答，而非依据检索到的文档
 
-3. **多次强制读文档** — 原 `doc_read_forced` 是二值 flag（只强制 1 次）。改为 `unique_docs_read` 集合 + `max_docs_to_read=3`，模型搜了不读时重复强制，直到读完 3 篇不同文档。
+**错误模式：**
+- hallucination (搜了但答错): 42 条 (95%)
+- wrong_query: 1 条 (2%)
+- context_overload: 1 条 (2%)
+- insufficient_search: 0 条 (0%) ✅ — tc=0 问题已彻底解决
 
-4. **搜索去重** — `is_duplicate_query()` 从精确字符串匹配升级为 Jaccard token 重叠度 > 80% 检测。命中时插入 user message 提示换搜索角度。减少 BM25 重复检索的浪费。
+**正确（6 题）：** q5, q53, q397, q432, q684, q1095
 
-**预期收益与风险：**
-- 收益：模型读全文增多 → hallucination 减少；停止更宽松 → 更多搜索轮次
-- 风险：自动加载 top-1 可能误导（top-1 不一定是相关文档）；停止放宽 → 更长推理时间；多次强制读可能打乱模型节奏
+**存在问题：**
+1. avg retrieved docs = 0.24 说明自动加载 top-1 全文的机制没有理想工作——可能是注入的全文只有前 3000 字符，关键信息在文档后半段
+2. 模型即使在有全文的情况下仍然选择"不相信"文档，靠记忆回答
+3. 接下来需要更强的"强制基于文档"机制，或者尝试更小的 snippet + 强制要求完整文档阅读
 
-**改动的文件：**
-- `agent/deep_research_agent.py` — SimpleTracker 重写 + solve() 方法扩展
+## V1 五项改进 (2026-05-29)
+
+针对 12% 准确率中 95% hallucination 的根因，实施 5 项并行改进：
+
+### Plan 1: Multi-Query 搜索扩展
+**问题**: BM25 是纯关键词匹配，复杂自然语言查询的单次检索召回率极低。模型看不到相关文档 → 凭训练记忆回答 → hallucination。
+
+**方案**: 单个 `search()` 调用内部自动扩展为 4 个不同角度的 BM25 查询（1 个原始改写 + 3 个 LLM 生成的多样化变体），全部检索后合并去重。
+
+**改动**: `tools.py` 新增 `_expand_queries()` 函数，修改 `get_agent_tool_specs_and_registry` 中的 `search()` 闭包。
+
+### Plan 2: 强制证据引用
+**问题**: 答案格式 `Explanation + Exact Answer + Confidence` 允许模型"凭感觉"回答，不要求提供文档证据。
+
+**方案**: 答案格式改为强制要求 `Evidence: <docid> "<verbatim quote>"`。模型输出缺少 Evidence 字段时自动阻断并提醒。
+
+**改动**: `deep_research_agent.py` 更新 SYSTEM_PROMPT + solve() 中回答前格式检查。
+
+### Plan 3: 自动 find_in_doc 精确定位
+**问题**: `get_document()` 返回全文（或前 3000 字符），但对一本书来说开头只是目录和序言，答案在 300 页之后。
+
+**方案**: Agent 启动时用 LLM 从问题中提取 5 个关键实体/短语（`_extract_key_terms`）。模型调用 `get_document()` 读长文档（>1500 字符）时，系统自动对每个关键实体执行 `find_in_doc()`，将匹配段落注入对话。
+
+**改动**: `deep_research_agent.py` 新增 `_extract_key_terms()` 函数 + solve() 中的自动触发逻辑。
+
+### Plan 4: 分层检索（搜索专用阶段）
+**问题**: 模型搜一下就想回答，缺乏系统性证据收集。
+
+**方案**: 前 3 轮强制为搜索阶段，任何回答尝试都被阻断并引导继续搜索。第 4 轮起才允许回答。
+
+**改动**: `deep_research_agent.py` solve() 中 `tool_choice="required"` 覆盖 rounds 1-3 + 回答前轮次检查。
+
+### Plan 5: 硬化 Verification 循环
+**问题**: `verify_claim()` 依赖模型自主调用，模型可能忽视验证结果直接回答。
+
+**方案**: 模型试图回答时系统自动调用 `verify_claim()`，解析 "Supported: YES/NO"。NO 时自动阻断、注入失败信息、强制重搜。YES + Evidence 检查通过才允许输出。
+
+**改动**: `deep_research_agent.py` solve() 中的自动验证逻辑 + 阻断+重搜循环 + verify_passed 状态追踪。
+
+---
+
+**预期效果：**
+- Plan 1: 检索召回率提升 3-4 倍，更多相关文档进入上下文
+- Plan 2+5: 直接对抗 hallucination，强制答案必须基于文档
+- Plan 3: 解决"读了但没读到关键段落"的问题
+- Plan 4: 保证前 3 轮专注于证据收集
+
+**待验证：** hard50 全量评估

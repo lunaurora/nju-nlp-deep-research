@@ -15,19 +15,23 @@ from .vllm_client import VLLMClient
 
 SYSTEM_PROMPT = """You are a Deep Research Agent. Follow these steps STRICTLY in order:
 
-STEP 1 — SEARCH: Call search() with specific keywords. Search at least 2-3 different queries.
-STEP 2 — READ FULL DOCUMENTS: After finding relevant results, ALWAYS call get_document() to read the full text. Snippets are NEVER sufficient — always read the complete document.
-STEP 3 — CROSS-REFERENCE: Read multiple documents and compare facts across them.
-STEP 4 — VERIFY: Call verify_claim() to check your answer against the documents.
-STEP 5 — ANSWER: Output in this format:
+STEP 1 — SEARCH: Call search() multiple times with different keywords covering different aspects of the question. Search at least 2-3 different queries.
 
-Explanation: <one sentence showing what evidence supports your answer>
+STEP 2 — READ FULL DOCUMENTS: After finding relevant results, ALWAYS call get_document() to read the full text. Snippets are NEVER sufficient — always read the complete document.
+
+STEP 3 — CROSS-REFERENCE: Read multiple documents and compare facts across them. Find direct evidence for each specific claim in the question.
+
+STEP 4 — VERIFY: Call verify_claim() to check your answer against the documents before finalizing.
+
+STEP 5 — ANSWER: Output in this EXACT format. You MUST include a verbatim quote from the document(s):
+
+Evidence: <docid> "<direct quote from the document supporting your answer>"
 Exact Answer: <concise, complete answer>
 Confidence: <high|medium|low>
 
 ## Available Tools
 
-- **search(query)** — Search the corpus (uses BM25 keyword matching; queries auto-optimized for concrete keyword extraction, so use natural language freely).
+- **search(query)** — Search the corpus (BM25 keyword matching; queries auto-expanded to multiple variants for better coverage).
 - **get_document(docid)** — Read a full document by its docid.
 - **find_in_doc(docid, keyword)** — Search within a document for a keyword.
 - **decompose_question(question)** — Break a complex question into sub-queries (auto-called at start).
@@ -36,15 +40,52 @@ Confidence: <high|medium|low>
 ## CRITICAL RULES
 1. NEVER answer without reading at least 2 full documents first.
 2. After each search, immediately call get_document() on any relevant result.
-3. Call verify_claim() before your final answer to prevent mistakes.
-4. Never include <think> tags in your final answer.
-5. If evidence is insufficient, give Best Guess with low confidence."""
+3. Your answer MUST include Evidence: with a verbatim quote and docid.
+4. Call verify_claim() before your final answer to prevent mistakes.
+5. Never include <think> tags in your final answer.
+6. If evidence is insufficient, give Best Guess with low confidence."""
 
 
 def extract_answer(text: str) -> str:
     """Extract Exact Answer from model output."""
     match = re.search(r'Exact Answer:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
     return match.group(1).strip() if match else text.strip()
+
+
+def _extract_key_terms(question: str, client: Any, model_name: str, max_terms: int = 5) -> List[str]:
+    """Extract key search terms/phrases from question for targeted within-document search (Plan 3)."""
+    prompt = (
+        f"Extract {max_terms} key search terms or short phrases from this question. "
+        "These will be used to find relevant passages inside documents.\n"
+        "Rules:\n"
+        "- Focus on: proper names, dates, unique multi-word phrases, technical terms\n"
+        "- Each term should be 1-4 words, likely to appear verbatim in a document\n"
+        "- Avoid generic words: book, company, person, year, located, called, known\n"
+        "- Output one term per line, no numbering, no explanation\n\n"
+        "Example:\n"
+        "Question: A book about inland discoveries in the 1920s, published by a company from the 1880s. A barrel-shaped floating vessel is described on pages 332-339.\n"
+        "->\n"
+        "barrel-shaped floating vessel\n"
+        "spear attack botanist\n"
+        "inland discoveries\n"
+        "1920s\n"
+        "publishing founded 1880s"
+    )
+    try:
+        resp = client.simple_chat(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": "Extract key search terms from questions."},
+                {"role": "user", "content": f"{prompt}\n\nQuestion: {question}"},
+            ],
+            temperature=0.0,
+            max_tokens=128,
+        )
+        text = resp["choices"][0]["message"]["content"].strip()
+        terms = [t.strip() for t in text.split("\n") if t.strip() and len(t.strip()) > 2]
+        return terms[:max_terms]
+    except Exception:
+        return []
 
 
 def truncate_content(content: Any, max_chars: int = 2000) -> str:
@@ -171,6 +212,10 @@ class DeepResearchAgent:
         max_docs_to_read = 3
         auto_loaded_top1 = False
         verify_forced = False
+        search_phase_max_round = 3        # Plan 4: search-only for first N rounds
+        auto_found_docids: set = set()    # Plan 3: track docs with auto find_in_doc
+        verify_passed = False             # Plan 5: hardened verification status
+        key_terms = _extract_key_terms(question, self.client, self.model_name)
 
         for round_idx in range(1, self.max_rounds + 1):
             # ── Context compression (once, after round 4) ──
@@ -178,8 +223,8 @@ class DeepResearchAgent:
                 messages = compress_old_rounds(messages, tracker)
                 compress_done = True
 
-            # ── Force tool use on round 1 (model tends to answer from memory) ──
-            tool_choice = "required" if round_idx == 1 else "auto"
+            # ── Plan 4: Force tool use in search-only phase (rounds 1-3) ──
+            tool_choice = "required" if round_idx <= search_phase_max_round else "auto"
 
             # ── Call vLLM ──
             response = self.client.simple_chat(
@@ -227,19 +272,51 @@ class DeepResearchAgent:
 
             # ── Model decided to answer directly ──
             if not tool_calls:
-                # Force verification before final answer (once)
-                if "verify_claim" in self.tool_registry and not verify_forced and round_idx < self.max_rounds:
-                    verify_forced = True
+                # ── Plan 4: Search-only phase — block answers before round 4 ──
+                if round_idx <= search_phase_max_round:
                     messages.append({
                         "role": "user",
-                        "content": "Before finalizing, call verify_claim() with your candidate answer and the docids of supporting documents to check your evidence."
+                        "content": "SEARCH PHASE: You must search more before answering. Call search() with different keywords covering different aspects of the question. Do NOT answer yet."
                     })
                     continue
+
+                # ── Plan 5: Hardened auto-verification ──
+                if "verify_claim" in self.tool_registry and not verify_passed and round_idx < self.max_rounds and unique_docs_read:
+                    verify_forced = True
+                    answer_text = extract_answer(content)
+                    if answer_text and len(answer_text) > 3:
+                        docids_str = ",".join(sorted(unique_docs_read)[:5])
+                        verification = self.tool_registry["verify_claim"](answer_text, docids_str)
+                        if "Supported: YES" in verification or "Supported:YES" in verification:
+                            verify_passed = True
+                        else:
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"Verification says your answer may NOT be supported by the evidence:\n"
+                                    f"{verification[:500]}\n\n"
+                                    f"Search for more specific evidence before answering. "
+                                    f"Do NOT repeat the same answer without new evidence."
+                                )
+                            })
+                            continue
+
+                # ── Plan 2: Enforce Evidence: format in final answer ──
+                if "Evidence:" not in content:
+                    messages.append({
+                        "role": "user",
+                        "content": "Your answer is missing an Evidence section. Include:\n"
+                                   "Evidence: <docid> \"<direct quote from the document>\"\n"
+                                   "Exact Answer: <answer>\nConfidence: <level>"
+                    })
+                    verify_passed = False  # force re-verify if answer changes
+                    continue
+
                 return {
                     "query_id": query_id,
                     "question": question,
                     "predicted_answer": extract_answer(content),
-                    "status": "completed",
+                    "status": "completed" if verify_passed else "unverified",
                     "messages": messages,
                     "num_tool_calls": num_tool_calls,
                     "rounds_used": round_idx,
@@ -302,6 +379,27 @@ class DeepResearchAgent:
                         "tool_call_id": tc["id"],
                         "content": truncated,
                     })
+
+                    # ── Plan 3: Auto find_in_doc for long documents ──
+                    if name == "get_document" and isinstance(result, dict) and result.get("text"):
+                        docid = args.get("docid", "")
+                        if docid not in auto_found_docids:
+                            auto_found_docids.add(docid)
+                            doc_text = result.get("text", "")
+                            if len(doc_text) > 1500 and key_terms and "find_in_doc" in self.tool_registry:
+                                for term in key_terms[:3]:
+                                    try:
+                                        find_result = self.tool_registry["find_in_doc"](docid, term)
+                                        if isinstance(find_result, dict) and find_result.get("total_matches", 0) > 0:
+                                            messages.append({
+                                                "role": "user",
+                                                "content": (
+                                                    f"[Relevant section in {docid} for '{term}']:\n"
+                                                    f"{json.dumps(find_result, ensure_ascii=False)[:1200]}"
+                                                )
+                                            })
+                                    except Exception:
+                                        pass
                 except Exception as e:
                     messages.append({
                         "role": "tool",
