@@ -24,7 +24,7 @@
 import argparse
 import json
 import re
-import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -32,16 +32,18 @@ from .dataset_utils import load_jsonl
 from .vllm_client import VLLMClient
 
 
-# ── Eval prompt ──────────────────────────────────────────────
 EVAL_SYSTEM_PROMPT = """You are an expert evaluator for question-answering systems.
 Your task is to judge whether a predicted answer is semantically equivalent to the gold (reference) answer.
 
 Rules:
-- Ignore case differences, punctuation variations, and extra whitespace.
-- Treat abbreviations and full forms as equivalent (e.g., "US" = "United States").
-- If the predicted answer contains the gold answer as a substring (or vice versa) and the extra content does not change the meaning, treat as CORRECT.
-- If the predicted answer is a valid alternative phrasing of the gold answer, treat as CORRECT.
-- If the predicted answer is clearly wrong, incomplete in a meaningful way, or contradicts the gold answer, treat as INCORRECT.
+- Mark CORRECT only when the predicted answer matches the gold answer exactly after normalization, or is an unambiguous equivalent that refers to the same entity, date, title, quantity, or fact.
+- Ignore only harmless differences in case, punctuation, articles, spacing, and obvious formatting variants.
+- Treat standard abbreviations and full forms as equivalent only when they clearly refer to the same answer.
+- If the gold answer is specific but the predicted answer says the answer cannot be determined, is unknown, lacks evidence, or is insufficient, mark INCORRECT.
+- If the predicted answer is broader, narrower, related, partially correct, speculative, or only thematically similar, mark INCORRECT.
+- Different people, organizations, places, titles, dates, years, percentages, and numeric values are INCORRECT, even if they are plausible.
+- For book/article/chapter/song/report titles, require the same title or a trivially formatted variant; thematic paraphrases are INCORRECT.
+- If the predicted answer contains extra content, mark CORRECT only if the final answer is still explicit, unambiguous, and fully consistent with the gold answer.
 
 Reply in exactly this format:
 Judgment: CORRECT
@@ -58,33 +60,67 @@ def _build_eval_user_message(gold_answer: str, predicted_answer: str, question: 
 
 
 def _parse_eval_response(response_text: str) -> Tuple[str, str]:
-    """Parse the eval model's response, returning (judgment, reasoning)."""
     judgment = "INCORRECT"
     reasoning = ""
 
-    # Match "Judgment: CORRECT" or "Judgment: INCORRECT"
-    jud_match = re.search(r'Judgment:\s*(CORRECT|INCORRECT)', response_text, re.IGNORECASE)
+    jud_match = re.search(r"Judgment:\s*(CORRECT|INCORRECT)", response_text, re.IGNORECASE)
     if jud_match:
         judgment = jud_match.group(1).upper()
 
-    # Match reasoning
-    reason_match = re.search(r'Reasoning:\s*(.+?)$', response_text, re.IGNORECASE | re.DOTALL)
+    reason_match = re.search(r"Reasoning:\s*(.+?)$", response_text, re.IGNORECASE | re.DOTALL)
     if reason_match:
         reasoning = reason_match.group(1).strip()
 
     return judgment, reasoning
 
 
-def _extract_predicted_answer(messages: List[Dict[str, Any]]) -> str:
-    """Extract the predicted answer from the last assistant message."""
+def _extract_submission_answer(messages: List[Dict[str, Any]]) -> str:
     for msg in reversed(messages):
         if msg.get("role") == "assistant" and msg.get("content"):
-            return msg["content"].strip()
+            return str(msg["content"]).strip()
     return ""
 
 
+def _strip_thinking(text: str) -> str:
+    stripped = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    stripped = re.sub(r"</?think>", "", stripped, flags=re.IGNORECASE)
+    return stripped.strip()
+
+
+def _extract_final_answer(text: str) -> str:
+    if not text:
+        return ""
+
+    cleaned = str(text).strip()
+    for label in ("Exact Answer", "Final Answer", "Answer"):
+        match = re.search(
+            rf"{label}\s*:\s*(.+?)(?:\n(?:Confidence|Explanation|Reasoning|Notes?)\s*:|$)",
+            cleaned,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            return match.group(1).strip()
+
+    cleaned = _strip_thinking(cleaned)
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    if lines[-1].lower().startswith("confidence:") and len(lines) >= 2:
+        return lines[-2]
+    return lines[-1]
+
+
+def _build_eval_extra_payload(model_name: str, disable_thinking: bool) -> Optional[Dict[str, Any]]:
+    if disable_thinking and "qwen" in model_name.lower():
+        return {
+            "chat_template_kwargs": {
+                "enable_thinking": False,
+            }
+        }
+    return None
+
+
 def _count_tool_calls(messages: List[Dict[str, Any]]) -> int:
-    """Count total tool_calls across all assistant messages."""
     count = 0
     for msg in messages:
         if msg.get("role") == "assistant" and msg.get("tool_calls"):
@@ -93,40 +129,106 @@ def _count_tool_calls(messages: List[Dict[str, Any]]) -> int:
 
 
 def _extract_retrieved_docids(messages: List[Dict[str, Any]]) -> List[str]:
-    """Extract all docids from tool responses."""
-    docids = []
+    docids: List[str] = []
     for msg in messages:
-        if msg.get("role") == "tool":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                try:
-                    parsed = json.loads(content)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(parsed, list):
-                    for item in parsed:
-                        if isinstance(item, dict) and "docid" in item:
-                            docids.append(item["docid"])
-                elif isinstance(parsed, dict) and "docid" in parsed:
-                    docids.append(parsed["docid"])
+        if msg.get("role") != "tool":
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            continue
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict) and "docid" in item:
+                    docids.append(str(item["docid"]))
+        elif isinstance(parsed, dict) and "docid" in parsed:
+            docids.append(str(parsed["docid"]))
     return docids
 
 
 def _compute_trajectory_stats(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Compute statistics from a single trajectory."""
-    tool_call_count = _count_tool_calls(messages)
     retrieved_docids = _extract_retrieved_docids(messages)
-    num_assistant_msgs = sum(1 for m in messages if m.get("role") == "assistant")
-    num_tool_msgs = sum(1 for m in messages if m.get("role") == "tool")
+    unique_retrieved_docids = list(dict.fromkeys(retrieved_docids))
 
     return {
-        "num_tool_calls": tool_call_count,
-        "num_assistant_messages": num_assistant_msgs,
-        "num_tool_messages": num_tool_msgs,
+        "num_tool_calls": _count_tool_calls(messages),
+        "num_assistant_messages": sum(1 for m in messages if m.get("role") == "assistant"),
+        "num_tool_messages": sum(1 for m in messages if m.get("role") == "tool"),
         "num_retrieved_docs": len(retrieved_docids),
-        "unique_retrieved_docids": len(set(retrieved_docids)),
-        "retrieved_docids": list(set(retrieved_docids)),
+        "unique_retrieved_docids": len(unique_retrieved_docids),
+        "retrieved_docids": unique_retrieved_docids,
     }
+
+
+def _evaluate_one_submission(
+    submission_index: int,
+    submission: Dict[str, Any],
+    gold_map: Dict[str, str],
+    gold_question_map: Dict[str, str],
+    model_name: str,
+    base_url: str,
+    api_key: str,
+    eval_system_prompt: str,
+    temperature: float,
+    max_tokens: int,
+    disable_thinking: bool,
+    extract_final_answer_only: bool,
+) -> Tuple[int, Optional[Dict[str, Any]]]:
+    query_id = str(submission.get("query_id", ""))
+    gold_answer = gold_map.get(query_id, "")
+    question = gold_question_map.get(query_id, "")
+
+    if not gold_answer:
+        return submission_index, None
+
+    messages = submission.get("messages", [])
+    raw_predicted_answer = str(submission.get("predicted_answer", "")).strip() or _extract_submission_answer(messages)
+    predicted_answer = _extract_final_answer(raw_predicted_answer) if extract_final_answer_only else raw_predicted_answer
+
+    eval_text = ""
+    if not predicted_answer:
+        judgment = "INCORRECT"
+        if extract_final_answer_only:
+            reasoning = "No final answer found in submission."
+        else:
+            reasoning = "No predicted answer found in submission."
+    else:
+        client = VLLMClient(base_url=base_url, api_key=api_key)
+        eval_messages = [
+            {"role": "system", "content": eval_system_prompt},
+            {"role": "user", "content": _build_eval_user_message(gold_answer, predicted_answer, question)},
+        ]
+        try:
+            response = client.simple_chat(
+                model=model_name,
+                messages=eval_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                extra_payload=_build_eval_extra_payload(model_name, disable_thinking),
+            )
+            eval_text = response["choices"][0]["message"]["content"]
+            judgment, reasoning = _parse_eval_response(eval_text)
+        except Exception as exc:
+            eval_text = f"ERROR: {exc}"
+            judgment = "INCORRECT"
+            reasoning = str(exc)
+
+    detail = {
+        "query_id": query_id,
+        "question": question,
+        "gold_answer": gold_answer,
+        "predicted_answer": predicted_answer,
+        "raw_predicted_answer": raw_predicted_answer,
+        "eval_judgment": judgment,
+        "eval_reasoning": reasoning,
+        "eval_model_response": eval_text,
+        "trajectory_stats": _compute_trajectory_stats(messages),
+        "status": submission.get("status", "unknown"),
+    }
+    return submission_index, detail
 
 
 def run_evaluation(
@@ -137,8 +239,12 @@ def run_evaluation(
     api_key: str = "dummy",
     output_path: Optional[str] = None,
     temperature: float = 0.0,
-    max_tokens: int = 256,
+    max_tokens: int = 4096,
     verbose: bool = True,
+    max_workers: int = 8,
+    disable_thinking: bool = True,
+    extract_final_answer_only: bool = True,
+    eval_system_prompt: str = EVAL_SYSTEM_PROMPT,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
     运行自动评估。
@@ -163,6 +269,14 @@ def run_evaluation(
         评估模型 max_tokens。
     verbose : bool
         是否打印进度。
+    max_workers : int
+        并行评估线程数。
+    disable_thinking : bool
+        是否在支持的评估模型上默认关闭 thinking。
+    extract_final_answer_only : bool
+        是否只抽取最终答案字段送入评估模型。
+    eval_system_prompt : str
+        评估系统提示词，默认使用模块内更严格的版本。
 
     Returns
     -------
@@ -171,89 +285,66 @@ def run_evaluation(
     details : list[dict]
         每个 query 的详细评估结果。
     """
-    # 加载数据
     submissions = load_jsonl(submission_path)
     dataset = load_jsonl(dataset_path)
 
-    # 建立 query_id -> gold answer 的映射
     gold_map: Dict[str, str] = {}
     gold_question_map: Dict[str, str] = {}
     for row in dataset:
-        gold_map[row["query_id"]] = row["answer"]
-        gold_question_map[row["query_id"]] = row.get("query", "")
+        query_id = str(row["query_id"])
+        gold_map[query_id] = row["answer"]
+        gold_question_map[query_id] = row.get("query", "")
 
-    client = VLLMClient(base_url=base_url, api_key=api_key)
-    details: List[Dict[str, Any]] = []
+    details_with_index: List[Tuple[int, Dict[str, Any]]] = []
     correct_count = 0
     total_count = 0
 
-    for sub in submissions:
-        query_id = sub.get("query_id", "")
-        gold_answer = gold_map.get(query_id, "")
-        question = gold_question_map.get(query_id, "")
-
-        if not gold_answer:
-            if verbose:
-                print(f"[WARN] query_id={query_id}: no gold answer found in dataset, skipping")
-            continue
-
-        messages = sub.get("messages", [])
-        predicted_answer = sub.get("predicted_answer", "")
-        if not predicted_answer:
-            predicted_answer = _extract_predicted_answer(messages)
-
-        eval_text = ""
-        if not predicted_answer:
-            judgment = "INCORRECT"
-            reasoning = "No predicted answer found in submission."
-        else:
-            # 调用 eval 模型
-            eval_messages = [
-                {"role": "system", "content": EVAL_SYSTEM_PROMPT},
-                {"role": "user", "content": _build_eval_user_message(gold_answer, predicted_answer, question)},
-            ]
-            try:
-                response = client.simple_chat(
-                    model=model_name,
-                    messages=eval_messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                eval_text = response["choices"][0]["message"]["content"]
-                judgment, reasoning = _parse_eval_response(eval_text)
-            except Exception as e:
-                if verbose:
-                    print(f"[ERROR] query_id={query_id}: eval model call failed: {e}")
-                eval_text = f"ERROR: {e}"
-                judgment = "INCORRECT"
-                reasoning = str(e)
-
-        if judgment == "CORRECT":
-            correct_count += 1
-        total_count += 1
-
-        # 轨迹统计
-        traj_stats = _compute_trajectory_stats(messages)
-
-        detail = {
-            "query_id": query_id,
-            "question": question,
-            "gold_answer": gold_answer,
-            "predicted_answer": predicted_answer,
-            "eval_judgment": judgment,
-            "eval_reasoning": reasoning,
-            "eval_model_response": eval_text,
-            "trajectory_stats": traj_stats,
-            "status": sub.get("status", "unknown"),
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _evaluate_one_submission,
+                index,
+                submission,
+                gold_map,
+                gold_question_map,
+                model_name,
+                base_url,
+                api_key,
+                eval_system_prompt,
+                temperature,
+                max_tokens,
+                disable_thinking,
+                extract_final_answer_only,
+            ): submission
+            for index, submission in enumerate(submissions)
         }
-        details.append(detail)
 
-        if verbose:
-            print(f"[{query_id}] {judgment:>9s} | pred={predicted_answer[:60]}...")
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            submission = futures[future]
+            query_id = str(submission.get("query_id", ""))
+            submission_index, detail = future.result()
 
+            if detail is None:
+                if verbose:
+                    print(f"[WARN] [{completed}/{len(submissions)}] query_id={query_id}: no gold answer found, skipping")
+                continue
+
+            details_with_index.append((submission_index, detail))
+            if detail["eval_judgment"] == "CORRECT":
+                correct_count += 1
+            total_count += 1
+
+            if verbose:
+                print(
+                    f"[{completed}/{len(submissions)}] {detail['query_id']} "
+                    f"{detail['eval_judgment']:>9s} | pred={detail['predicted_answer'][:60]}..."
+                )
+
+    details = [detail for _, detail in sorted(details_with_index, key=lambda item: item[0])]
     accuracy = correct_count / total_count if total_count > 0 else 0.0
 
-    # 汇总统计
     all_tool_calls = [d["trajectory_stats"]["num_tool_calls"] for d in details]
     all_retrieved = [d["trajectory_stats"]["num_retrieved_docs"] for d in details]
 
@@ -269,20 +360,17 @@ def run_evaluation(
         "eval_model": model_name,
     }
 
-    # 输出结果文件
     if output_path:
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
         with output_file.open("w", encoding="utf-8") as f:
-            # 第一行写 summary
             f.write(json.dumps({"type": "summary", **summary}, ensure_ascii=False) + "\n")
-            # 后续行写每个 query 的详情
             for detail in details:
                 f.write(json.dumps(detail, ensure_ascii=False) + "\n")
 
     if verbose:
         print(f"\n{'='*50}")
-        print(f"Evaluation complete!")
+        print("Evaluation complete!")
         print(f"Accuracy: {accuracy:.2%} ({correct_count}/{total_count})")
         print(f"Avg tool calls/query: {summary['avg_tool_calls_per_query']}")
         print(f"Avg retrieved docs/query: {summary['avg_retrieved_docs_per_query']}")
@@ -292,7 +380,7 @@ def run_evaluation(
     return summary, details
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="自动评估 agent 预测结果")
     parser.add_argument("--submission", required=True, help="学生提交的 trajectory 文件 (submission.jsonl)")
     parser.add_argument("--dataset", required=True, help="原始数据集 (browsecomp_plus_hard50.jsonl)")
@@ -301,7 +389,28 @@ def main():
     parser.add_argument("--api-key", default="dummy", help="API key")
     parser.add_argument("--output", default=None, help="评估结果输出路径")
     parser.add_argument("--temperature", type=float, default=0.0, help="评估模型 temperature")
-    parser.add_argument("--max-tokens", type=int, default=256, help="评估模型 max_tokens")
+    parser.add_argument("--max-tokens", type=int, default=4096, help="评估模型 max_tokens")
+    parser.add_argument("--max-workers", type=int, default=8, help="并行评估线程数")
+    parser.add_argument(
+        "--disable-thinking",
+        dest="disable_thinking",
+        action="store_true",
+        default=True,
+        help="在支持的模型上默认关闭 thinking（默认开启此行为）。",
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        dest="disable_thinking",
+        action="store_false",
+        help="允许评估模型保留 thinking 输出。",
+    )
+    parser.add_argument(
+        "--use-raw-predicted-answer",
+        dest="extract_final_answer_only",
+        action="store_false",
+        default=True,
+        help="直接使用 submission 中的原始 predicted_answer，而不是先抽取最终答案。",
+    )
     args = parser.parse_args()
 
     if args.output is None:
@@ -317,6 +426,9 @@ def main():
         output_path=args.output,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
+        max_workers=args.max_workers,
+        disable_thinking=args.disable_thinking,
+        extract_final_answer_only=args.extract_final_answer_only,
     )
 
 

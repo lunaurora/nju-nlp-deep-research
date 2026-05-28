@@ -57,7 +57,9 @@ D:\nju-nlp-deep-research/
 │   ├── deep_research_agent.py       # V1 ReAct Agent（主线）
 │   ├── deep_research_agent_v2.py    # V2 模块化 Agent（有 bug 待修）
 │   ├── deep_research_agent_text.py  # 纯文本版 V1（备选）
-│   ├── tools.py                     # 工具定义：search / get_document / find_in_doc
+│   ├── tools.py                     # 工具定义：基础3个 + 高级2个 (LLM-powered)
+│   │                                #   基础: search / get_document / find_in_doc
+│   │                                #   高级: decompose_question / verify_claim
 │   ├── vllm_client.py               # vLLM HTTP 客户端
 │   ├── browsecomp_searcher.py       # BM25 检索实现
 │   ├── build_bm25_index.py          # 构建索引
@@ -87,10 +89,14 @@ system prompt → user question → model(tools) → execute tool → append res
 
 ### agent/tools.py
 
-三个工具函数（`get_agent_tool_specs_and_registry` 返回）:
+五个工具函数（`get_agent_tool_specs_and_registry` 返回）:
 1. `search(query)` → top-10 文档 snippet
 2. `get_document(docid)` → 完整文档
 3. `find_in_doc(docid, keyword)` → 文档内关键词搜索
+4. `decompose_question(question)` → 分解复杂问题为子查询（LLM 驱动，需传 client）
+5. `verify_claim(claim, docids)` → 验证候选答案是否被文档支持（LLM 驱动，需传 client）
+
+高级工具（4-5）在 `client` 参数传入时自动启用，否则只注册基础 3 个。
 
 ### agent/deep_research_agent_v2.py (V2, 有 bug)
 
@@ -145,8 +151,10 @@ cp -r * /mnt/workspace/
 - [x] V1 prompt 改进 + tool_choice="required"
 - [x] V2 bug 诊断
 - [x] 新增 find_in_doc 工具
-- [ ] tool_choice="required" 对 Qwen3 不够，已加 retry 机制
-- [ ] 迭代 V1 提高准确率
+- [x] tool_choice="required" 对 Qwen3 不够，已加 retry 机制
+- [x] 新增 decompose_question + verify_claim 两个高级工具
+- [x] 重写 system prompt：强制读全文、至少搜2次、禁止 <think> 在答案中
+- [ ] 验证改进后 hard50 准确率
 - [ ] V2 修复或重构
 - [ ] 消融实验
 - [ ] 提交最终结果
