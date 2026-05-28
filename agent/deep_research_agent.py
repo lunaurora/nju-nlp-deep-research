@@ -29,6 +29,11 @@ Evidence: <docid> "<direct quote from the document supporting your answer>"
 Exact Answer: <concise, complete answer>
 Confidence: <high|medium|low>
 
+## STOP CONDITIONS
+- If you searched 3+ different queries and found NO relevant documents → give Best Guess with LOW confidence.
+- If you read all available documents and verification still fails → give Best Guess with LOW confidence.
+- Do NOT repeat the same answer after verification says it is unsupported — try a different answer or give up.
+
 ## Available Tools
 
 - **search(query)** — Search the corpus (BM25 keyword matching; queries auto-expanded to multiple variants for better coverage).
@@ -216,10 +221,12 @@ class DeepResearchAgent:
         auto_found_docids: set = set()    # Plan 3: track docs with auto find_in_doc
         verify_passed = False             # Plan 5: hardened verification status
         key_terms = _extract_key_terms(question, self.client, self.model_name)
+        force_final_answer = False       # Dead-end: skip verify, force output
+        docs_count_at_last_verify = 0    # Track whether new docs appeared since last verify
 
         for round_idx in range(1, self.max_rounds + 1):
             # ── Context compression (once, after round 4) ──
-            if round_idx == 5 and not compress_done:
+            if round_idx == 4 and not compress_done:
                 messages = compress_old_rounds(messages, tracker)
                 compress_done = True
 
@@ -239,6 +246,8 @@ class DeepResearchAgent:
             choice = response["choices"][0]
             message = choice["message"]
             content = message.get("content") or ""
+            # Strip <think> blocks to save context (~30-50% reduction)
+            content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
             tool_calls = message.get("tool_calls") or []
 
             assistant_msg = {"role": "assistant", "content": content}
@@ -263,6 +272,7 @@ class DeepResearchAgent:
                 choice = response["choices"][0]
                 message = choice["message"]
                 content = message.get("content") or ""
+                content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
                 tool_calls = message.get("tool_calls") or []
 
                 assistant_msg = {"role": "assistant", "content": content}
@@ -280,8 +290,8 @@ class DeepResearchAgent:
                     })
                     continue
 
-                # ── Plan 5: Hardened auto-verification (skip if near max rounds) ──
-                if "verify_claim" in self.tool_registry and not verify_passed and round_idx < self.max_rounds - 1 and unique_docs_read:
+                # ── Plan 5: Hardened auto-verification with dead-end detection ──
+                if "verify_claim" in self.tool_registry and not verify_passed and round_idx < self.max_rounds - 1 and unique_docs_read and not force_final_answer:
                     verify_forced = True
                     answer_text = extract_answer(content)
                     if answer_text and len(answer_text) > 3:
@@ -290,19 +300,45 @@ class DeepResearchAgent:
                         if "Supported: YES" in verification or "Supported:YES" in verification:
                             verify_passed = True
                         else:
-                            messages.append({
-                                "role": "user",
-                                "content": (
-                                    f"Verification says your answer may NOT be supported by the evidence:\n"
-                                    f"{verification[:500]}\n\n"
-                                    f"Search for more specific evidence before answering. "
-                                    f"Do NOT repeat the same answer without new evidence."
-                                )
-                            })
-                            continue
+                            # Dead-end: verify failed and no new docs appeared → give up
+                            if len(unique_docs_read) <= docs_count_at_last_verify:
+                                force_final_answer = True
+                                messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        "Verification failed again with no new evidence available. "
+                                        "Give your Best Guess now with LOW confidence.\n\n"
+                                        "Evidence: <docids examined>\n"
+                                        "Exact Answer: <your best guess>\nConfidence: low"
+                                    )
+                                })
+                                continue
+                            else:
+                                docs_count_at_last_verify = len(unique_docs_read)
+                                messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        f"Verification says your answer may NOT be supported by the evidence:\n"
+                                        f"{verification[:500]}\n\n"
+                                        f"Search for more specific evidence before answering. "
+                                        f"Do NOT repeat the same answer without new evidence."
+                                    )
+                                })
+                                continue
 
                 # ── Plan 2: Enforce Evidence: format in final answer ──
                 if "Evidence:" not in content:
+                    if force_final_answer:
+                        # Dead-end: accept answer even without Evidence format
+                        return {
+                            "query_id": query_id,
+                            "question": question,
+                            "predicted_answer": extract_answer(content),
+                            "status": "best_guess",
+                            "messages": messages,
+                            "num_tool_calls": num_tool_calls,
+                            "rounds_used": round_idx,
+                        }
                     messages.append({
                         "role": "user",
                         "content": "Your answer is missing an Evidence section. Include:\n"

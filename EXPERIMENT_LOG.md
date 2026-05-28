@@ -192,3 +192,34 @@
 - `verify_claim` 全文搜索：提取 claim 关键词定位全文档，不只读 3000 字符
 - 最后轮 safe valve：`round_idx < max_rounds-1` 才验证，最后 1 轮直接答
 - 预期 tc 从 ~11 降回 ~5-6，预计准确率回到 12%+ 基线
+
+## V1 三项上下文 + 死胡同修复 (2026-05-29)
+
+| 项目 | 值 |
+|------|-----|
+| 版本 | V1 + think剥离 + 提前压缩 + 死胡同检测 + verify瘦身 |
+| 模型 | Qwen3-8B |
+| 提交 | 待验证（本地修复、尚未上云） |
+
+**针对 Component 1-3 的三项修复：**
+
+### Component 1: 停止条件 — 死胡同检测
+**问题**: 当 BM25 搜不到相关文档时，模型猜一个答案 → verify 拒绝 → 模型重复同一个答案 → verify 再拒绝 → 循环直到 HTTP 400。典型例子是 q815（1898年书+拍卖商父亲），模型猜 "The Picture of Dorian Gray"，verify 拒绝 3 次后还在循环。
+
+**方案**: 在 verify 失败时检查 `len(unique_docs_read)` 是否增长。若无新文档 → 置 `force_final_answer=True` → 跳过后续所有 verify 和 Evidence 格式检查 → 强制输出 Best Guess。
+- 最多浪费 1 轮而不是 7 轮
+- 避免上下文撑爆
+
+### Component 2: 上下文管理
+- **剥离 `<think>` 块**: Qwen3 的 `<think>...</think>` 占每条 assistant 回复 30-50% 的 token，完全没用（模型下次生成时会重新推理）。每次加入 messages 前用 `re.sub(r'<think>.*?</think>', ...)` 剥离。
+- **提前压缩**: round 5 → round 4，在上下文接近溢出前就裁剪。
+- **verify_claim 瘦身**: max_tokens 1024 → 256，每次验证省 4 倍 token。
+- **Evidence 检查死胡同绕过**: `force_final_answer=True` 时跳过格式检查直接输出。
+
+### Component 3: Prompt — STOP CONDITIONS 章节
+在 system prompt 新增 `## STOP CONDITIONS` 章节，明确告知模型三种停止条件：
+1. 搜了 3+ 次没找到文档 → Best Guess
+2. 读完所有文档 verify 还失败 → Best Guess
+3. 禁止重复被 verify 拒绝的答案
+
+**待上云验证**: 预期解决 HTTP 400 问题，工具调用从 ~5-11/题 降至 ~3-6/题，准确率保持 12%+ 或略有提升。

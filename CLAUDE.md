@@ -111,11 +111,14 @@ system prompt → user question → model(tools) → execute tool → append res
 ## Known Issues & Pitfalls
 
 1. **Qwen3 不调工具**: 即使有 tool 定义 + prompt 要求，Qwen3 `tool_choice="auto"` 可能直接凭记忆回答。修复: Round 1 强制 `tool_choice="required"`
-2. **Thinking 模式**: Qwen3 输出 `<think>...</think>` 推理过程后才回答。需要确保 parser 正确处理 thinking 块
+2. **Thinking 模式**: Qwen3 输出 `<think>...</think>` 推理过程后才回答。这些 think 块占 token 30-50% 且对后续推理无帮助，应在加入 messages 前剥离
 3. **vLLM 路径**: 华为云上模型在 `/opt/huawei/edu-apaas/src/init/Qwen3-8B`，不是 `./Qwen3-8B`
 4. **文件覆盖**: 多次运行 notebook 不覆盖 `submission.jsonl` — 已改为时间戳命名 `submission_MMDD_HHMM.jsonl`
 5. **版本管理**: 每次同步按 `MMDD_N-描述` 建独立文件夹，不覆盖旧版本，方便横向对比
 6. **工作区优先**: 先在版本文件夹里测试验证，确认没问题再复制到持久化存储
+7. **Verify 死循环**: verify 失败后如果无新文档可读，模型会重复猜同一个答案导致 HTTP 400。修复: `docs_count_at_last_verify` 死胡同检测 + `force_final_answer` 强制输出
+8. **上下文爆炸**: 主要来自 (a) `<think>` 块 (b) verify 死循环 (c) auto-load top-1 全文的 3000 字符。修复: 剥离 think + 死胡同检测 + 提前压缩
+9. **BM25 零召回**: 复杂自然语言查询第一跳可能召回 0 篇相关文档。extract_key_terms + multi-query 扩展可以缓解但无法完全解决
 
 ## 华为云环境
 
@@ -281,9 +284,12 @@ Agent 启动时用 LLM 从问题中提取 5 个关键实体/短语（`_extract_k
 - [x] **Plan 1**: Multi-Query 搜索扩展 — 单 search() 自动 4 查询合并
 - [x] **Plan 2**: 强制证据引用 — Evidence: 格式 + 自动检查
 - [x] **Plan 3**: 自动 find_in_doc — 关键实体提取 + 长文档精确定位
-- [x] **Plan 4**: 分层检索 — 前 3 轮搜索专用阶段
-- [x] **Plan 5**: 硬化 Verification — 自动验证 + 阻断 + 重搜循环
-- [ ] 验证 5 项改进后 hard50 准确率
+- [x] **Plan 4**: 分层检索 — 前 3 轮搜索专用阶段 (已降为 1 轮)
+- [x] **Plan 5**: 硬化 Verification — 自动验证 + 阻断 + 重搜循环 (已修复死循环)
+- [x] **Component 1 - 死胡同检测**: verify 失败且无新文档 → 强制 Best Guess
+- [x] **Component 2 - 上下文管理**: 剥离 think 块 + round 4 压缩 + verify 瘦身
+- [x] **Component 3 - STOP CONDITIONS**: prompt 新增停止条件章节
+- [ ] 上云验证 v1.6 修复后准确率
 - [ ] V2 修复或重构
 - [ ] 消融实验
 - [ ] 提交最终结果

@@ -319,7 +319,7 @@ def get_agent_tool_specs_and_registry(
                         {"role": "user", "content": f"Documents:\n{context}\n\nClaim: {claim}"},
                     ],
                     temperature=0.0,
-                    max_tokens=1024,
+                    max_tokens=256,
                 )
                 return resp["choices"][0]["message"]["content"]
             except Exception as e:

@@ -375,6 +375,7 @@ Notebook 第 7 节内置了自动消融实验脚本。
 | 2026-05-26 | v1.0 | V1 ReAct Agent + Notebook + 文档 |
 | 2026-05-26 | v2.0 | V2 模块化系统：6 大模块 + 消融实验 |
 | 2026-05-29 | v1.5 | V1 五项并行改进：Multi-Query扩展 + 证据引用 + 自动定位 + 分层检索 + 硬化验证 |
+| 2026-05-29 | v1.6 | V1 死胡同检测 + think剥离 + 提前压缩 + verify瘦身 + STOP CONDITIONS |
 
 ---
 
@@ -410,7 +411,84 @@ Notebook 第 7 节内置了自动消融实验脚本。
 
 ---
 
-## 十、Open Track 加分扩展
+## 十一、V1 死胡同检测 + 上下文管理综合修复 (2026-05-29)
+
+针对 V1 五项改进上云后出现的 HTTP 400 上下文溢出问题，实施三项综合修复，覆盖作业要求的全部三个组件：
+
+### 1. 停止条件：死胡同检测（Component 1）
+
+**现象**: q815 中 BM25 搜不到相关文档 → 模型猜 "The Picture of Dorian Gray" → verify 拒绝 → 重复同一个答案 → verify 再拒绝 → 死循环直到 HTTP 400。6 题跑了 300 秒，第 7 题直接爆。
+
+**根因**: `verify_claim` 失败后的处理逻辑没有区分"有证据但矛盾"和"根本没证据"。前者应该鼓励重搜，后者应该立刻放弃。
+
+**修复**: 在 verify 失败时比较本轮 `len(unique_docs_read)` 与上次 verify 时的值。若无增长 → 置 `force_final_answer = True` → 跳过后续所有 verify 和格式检查 → 强制 Best Guess 输出。最多浪费 1 轮而非 7 轮。
+
+```python
+# deep_research_agent.py
+if len(unique_docs_read) <= docs_count_at_last_verify:
+    force_final_answer = True
+    # → 直接引导模型输出 Best Guess
+else:
+    docs_count_at_last_verify = len(unique_docs_read)
+    # → 正常提示继续搜索
+```
+
+### 2. 上下文管理三项优化（Component 2）
+
+| 优化 | 实现位置 | 效果 |
+|------|----------|------|
+| **剥离 `<think>` 块** | assistant 回复加入 messages 前用正则过滤 | 每条回复节省 30-50% token |
+| **提前压缩** | round 5 → round 4 触发 `compress_old_rounds` | 在溢出前主动裁剪 |
+| **verify 瘦身** | `verify_claim` 的 max_tokens 从 1024 降到 256 | 每次验证省 4 倍上下文 |
+
+`<think>` 块剥离的具体实现：
+```python
+content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+```
+Qwen3 的 `<think>` 内容是模型单轮推理的内部对话，对后续轮次完全无用（模型会重新生成），且占 token 极大。从日志统计看，q442 的单条回复中 `<think>` 块占 60%+ 的字符数。
+
+### 3. Prompt 改进（Component 3）
+
+在 system prompt 的 STEP 5 和 Available Tools 之间新增 `## STOP CONDITIONS` 章节：
+
+```
+## STOP CONDITIONS
+- If you searched 3+ different queries and found NO relevant documents → give Best Guess with LOW confidence.
+- If you read all available documents and verification still fails → give Best Guess with LOW confidence.
+- Do NOT repeat the same answer after verification says it is unsupported — try a different answer or give up.
+```
+
+同时新增 `force_final_answer` 状态，在死胡同时绕过 Evidence 格式检查（`deep_research_agent.py:330-341`），防止模型被格式要求卡死在死循环中。
+
+### 预期效果
+- HTTP 400 问题解决，全量 50 题可完整跑完
+- 工具调用从 ~5-11/题 降至 ~3-6/题
+- 准确率保持 12%+ baseline
+
+### 错误轨迹分析示例（q815）
+
+从 vLLM 日志可以看到完整的死循环：
+
+```
+Round 1: search("author born 1860s parent auctioneer") → 0 篇相关
+         search("illustrator lost sibling 1900 Royal Academy") → 0 篇相关
+         search("book published 1898 author 1860s") → 0 篇相关
+         BM25 全部返回无关文档（Plex教程、FDA药物标签、传记名录...）
+
+Round 2: 模型猜 "The Picture of Dorian Gray by Oscar Wilde"
+         → 系统自动 verify_claim() → 文档里没有 → "Supported: NO"
+         → 系统说"继续搜"
+
+Round 3: 模型无新文档可读 → 又猜同一个答案
+         → verify_claim() 又 NO
+         → 循环...
+
+第 N 轮: 上下文撑爆 → HTTP 400
+```
+
+**教训**: verify 在"搜不到证据"和"证据显示答案是错的"两种情况下都应该用不同的处理策略。前者应允许模型放弃，后者应引导重新搜索。
+
+---
 
 | 方向 | 分值 | 实现思路 |
 |------|------|----------|
