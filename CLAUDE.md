@@ -268,28 +268,73 @@ Agent 启动时用 LLM 从问题中提取 5 个关键实体/短语（`_extract_k
 - 准确率 ≥12% 开始计分
 - 实验记录保存在 `EXPERIMENT_LOG.md`
 
-## 当前进度 (2026-05-29)
+## BrowseComp-Plus 题目风格分析 (hard50)
 
-- [x] V1 baseline: 8.00% (4/50), 57% tc=0 错误
-- [x] V1 prompt 改进 + tool_choice="required"
-- [x] V2 bug 诊断
-- [x] 新增 find_in_doc 工具
-- [x] tool_choice="required" 对 Qwen3 不够，已加 retry 机制
-- [x] 新增 decompose_question + verify_claim 两个高级工具
-- [x] 重写 system prompt：强制读全文、至少搜2次、禁止 <think> 在答案中
-- [x] 自动 top-1 全文加载：首次搜索后自动注入 top 文档全文
-- [x] 停止条件放宽：1轮→3轮连续无新文档
-- [x] 多次强制读：1次→最多3次强制 get_document
-- [x] 搜索去重：Jaccard token 重叠 > 80% 检测
-- [x] **Plan 1**: Multi-Query 搜索扩展 — 单 search() 自动 4 查询合并
-- [x] **Plan 2**: 强制证据引用 — Evidence: 格式 + 自动检查
-- [x] **Plan 3**: 自动 find_in_doc — 关键实体提取 + 长文档精确定位
-- [x] **Plan 4**: 分层检索 — 前 3 轮搜索专用阶段 (已降为 1 轮)
-- [x] **Plan 5**: 硬化 Verification — 自动验证 + 阻断 + 重搜循环 (已修复死循环)
-- [x] **Component 1 - 死胡同检测**: verify 失败且无新文档 → 强制 Best Guess
-- [x] **Component 2 - 上下文管理**: 剥离 think 块 + round 4 压缩 + verify 瘦身
-- [x] **Component 3 - STOP CONDITIONS**: prompt 新增停止条件章节
-- [ ] 上云验证 v1.6 修复后准确率
-- [ ] V2 修复或重构
-- [ ] 消融实验
-- [ ] 提交最终结果
+### 问题结构
+所有 50 题都是**多跳推理链**，典型结构：
+```
+实体 A → 文档 X → 实体 B → 文档 Y → ... → 答案
+```
+答案类型：人名（最常见）、书名、公司名、数字/年份、具体实体名。
+
+### 核心检索困难
+BM25 搜索效果取决于问题中是否包含**可检索的专有名词**。按 BM25 友好度可分为两类：
+
+| 类别 | 占比 | 特征 | 示例 |
+|------|------|------|------|
+| **BM25 友好型** | ~25% | 包含组织名、机构名、人名、具体数字等关键词 | q5 (Malaria Consortium, Ogilvy & Mather, WHO) |
+| **BM25 不友好型** | ~75% | 全自然语言描述，无专有名词，高度抽象 | q442 ("certain inland discoveries", "barrel-shaped floating vessel") |
+
+**模型得分主要来自 BM25 友好型**——这些题通过 1-2 次 search 就能定位到相关文档。
+
+### BM25 不友好题型的根因
+1. **描述性语言**：题目用"关于某内陆发现的书"代替书名，用"某人的父亲"代替人名
+2. **时间范围约束**：大量 `between X and Y (inclusive/exclusive)`，BM25 无法理解数值范围
+3. **串行推理依赖**：必须跨文档追踪实体链，单次 search 最多命中一环
+4. **干扰文档极多**：平均 70-100+ 干扰文档/题，BM25 top-10 信噪比极低
+
+### 对策略的影响
+- BM25 友好型题是主要得分来源 → 前几轮快速识别并作答
+- BM25 不友好型题 → 关键词改写 + Multi-Query 多点爆破 + 最后轮 best guess
+- 模型"放弃"行为导致准确率降为 0 → 必须强制最后轮输出答案，不准说不知道
+
+## 当前进度 (2026-05-29 全面归档)
+
+### 已完成
+
+- [x] **V1 Baseline**: 8.00% (4/50), 57% tc=0 错误
+- [x] **V1 prompt 改进 + tool_choice**: tool_choice="required"(Qwen3 不支持) → auto + retry
+- [x] **V2 bug 诊断**: 6 模块设计在 32K 上下文 + 8B 模型下不可行，已废弃
+- [x] **5 个工具**: search(Multi-Query) / get_document / find_in_doc / decompose_question / verify_claim
+- [x] **System prompt**: 5 步命令式流程（Search→Read→Cross-ref→Verify→Answer）
+- [x] **自动 top-1 全文加载**: 首次搜索后自动注入 top 文档全文前 3000 字符
+- [x] **停止条件放宽**: 1 轮 → 3 轮连续无新文档
+- [x] **多次强制读**: 最多 3 次强制 get_document 提示
+- [x] **搜索去重**: Jaccard token 重叠 > 80% 检测
+- [x] **BM25 Query Rewriting**: search() 内部 LLM 关键词改写
+- [x] **Plan 1: Multi-Query**: 单 search() 自动 4 查询合并（原始改写 + 3 多样化变体）
+- [x] **Plan 2: 强制证据引用**: Evidence 格式 + 自动阻断
+- [x] **Plan 3: 自动 find_in_doc**: 关键实体提取 + 长文档精确定位
+- [x] **Plan 4: 分层检索**: 前 1 轮搜索专用（原 3 轮太严导致崩溃）
+- [x] **Plan 5: 硬化 Verification**: 自动验证 + 阻断 + 重搜循环 + 死胡同检测
+- [x] **Component 1: 死胡同检测**: verify 失败且无新文档 → force_final_answer
+- [x] **Component 2: 上下文管理**: 剥离 think 块(省30-50%) + round 4 压缩 + verify 256 max_tokens
+- [x] **Component 3(v1.6)**: STOP CONDITIONS（已删除 → 过保守导致全放弃）
+- [x] **Component 3(v1.7)**: FINAL ANSWER REQUIREMENT + enforce_concrete_answer 拒绝检测
+- [x] **上云验证 v1.6**: 6.00% (3/50), avg tc=3.52, 无 HTTP 400 — STOP CONDITIONS 矫枉过正
+- [x] **v1.7 本地修复**: 删除 STOP CONDITIONS + enforce_concrete_answer + 18 种拒绝模式检测
+- [x] **Notebook 清理**: 3.5/4 标签修正, 删除 6/7 节
+- [x] **题目风格分析**: hard50 25% BM25友好 + 75% BM25不友好
+- [x] **轨迹分析存档**: trajectories/0528-7_tool_choice_fix/ (q442 + analysis)
+- [x] **REPORT.md 重写**: 反映真实架构(V1主线/V2废弃) + 完整实验历程
+- [x] **记忆文件更新**: nlp_deep_research_status.md + MEMORY.md
+
+### 待完成（按优先级）
+
+- [ ] **P0: v1.7 上云验证** — git push → git pull → 修复 BM25 索引 → 跑全量 50 题 → 目标 ≥12%
+- [ ] **P1: 实体爆破搜索** — _expand_queries() 改为每个实体独立 search，各取 top-5
+- [ ] **P1: verify 结果收割** — verify_claim 返回 "Correct Answer: X" 时直接采纳
+- [ ] **P1: 最后 2 轮温度 0.0→0.3** — 增加答案多样性
+- [ ] **P2: 消融实验** — 子集 ~30 分钟
+- [ ] **P2: 轨迹正例分析** — 收集 6 道正确题轨迹
+- [ ] **P3: 最终提交** — 6 月 2 日前选定版本→跑 full 50→生成 submission→提交

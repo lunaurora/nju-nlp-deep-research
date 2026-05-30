@@ -29,10 +29,9 @@ Evidence: <docid> "<direct quote from the document supporting your answer>"
 Exact Answer: <concise, complete answer>
 Confidence: <high|medium|low>
 
-## STOP CONDITIONS
-- If you searched 3+ different queries and found NO relevant documents → give Best Guess with LOW confidence.
-- If you read all available documents and verification still fails → give Best Guess with LOW confidence.
-- Do NOT repeat the same answer after verification says it is unsupported — try a different answer or give up.
+## FINAL ANSWER REQUIREMENT
+You MUST output a concrete, specific answer. "Cannot be determined", "Unable to determine", "not supported by evidence" are NOT acceptable — a wrong guess is better than no answer.
+If evidence is insufficient, combine whatever partial clues you found and make your best guess.
 
 ## Available Tools
 
@@ -55,6 +54,26 @@ def extract_answer(text: str) -> str:
     """Extract Exact Answer from model output."""
     match = re.search(r'Exact Answer:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
     return match.group(1).strip() if match else text.strip()
+
+
+_REFUSAL_PATTERNS = [
+    "cannot be determined", "cannot be answered", "unable to determine",
+    "unable to answer", "not supported by evidence", "not supported by the evidence",
+    "no information provided", "no information available", "cannot be verified",
+    "cannot be confirmed", "could not be determined", "could not be answered",
+    "does not contain information", "does not provide enough information",
+    "do not have enough information", "lack sufficient evidence",
+    "insufficient evidence", "insufficient information",
+]
+
+
+def enforce_concrete_answer(answer: str) -> str:
+    """Check if answer is a refusal; if so, return a placeholder forcing a guess."""
+    lowered = answer.lower().strip()
+    for pattern in _REFUSAL_PATTERNS:
+        if pattern in lowered:
+            return "[Best Guess — model refused to answer]"
+    return answer
 
 
 def _extract_key_terms(question: str, client: Any, model_name: str, max_terms: int = 5) -> List[str]:
@@ -307,9 +326,9 @@ class DeepResearchAgent:
                                     "role": "user",
                                     "content": (
                                         "Verification failed again with no new evidence available. "
-                                        "Give your Best Guess now with LOW confidence.\n\n"
+                                        "You MUST give your best guess now — 'cannot be determined' is NOT allowed.\n\n"
                                         "Evidence: <docids examined>\n"
-                                        "Exact Answer: <your best guess>\nConfidence: low"
+                                        "Exact Answer: <your best guess — must be a specific answer>\nConfidence: low"
                                     )
                                 })
                                 continue
@@ -333,7 +352,7 @@ class DeepResearchAgent:
                         return {
                             "query_id": query_id,
                             "question": question,
-                            "predicted_answer": extract_answer(content),
+                            "predicted_answer": enforce_concrete_answer(extract_answer(content)),
                             "status": "best_guess",
                             "messages": messages,
                             "num_tool_calls": num_tool_calls,
@@ -351,7 +370,7 @@ class DeepResearchAgent:
                 return {
                     "query_id": query_id,
                     "question": question,
-                    "predicted_answer": extract_answer(content),
+                    "predicted_answer": enforce_concrete_answer(extract_answer(content)),
                     "status": "completed" if verify_passed else "unverified",
                     "messages": messages,
                     "num_tool_calls": num_tool_calls,
@@ -460,7 +479,7 @@ class DeepResearchAgent:
             if tracker.should_stop and round_idx >= 3 and not round_has_getdoc and not _just_forced_read:
                 messages.append({
                     "role": "user",
-                    "content": "Your last 3 rounds found no new documents. Please give your Best Guess answer now.\n\nFormat:\nExplanation: <reasoning>\nExact Answer: <answer>\nConfidence: low",
+                    "content": "Your last 3 rounds found no new documents. You MUST give your best guess now — 'cannot be determined' is NOT allowed.\n\nFormat:\nEvidence: <docids you examined>\nExact Answer: <your best guess — must be a specific answer>\nConfidence: low",
                 })
                 response = self.client.simple_chat(
                     model=self.model_name,
@@ -473,7 +492,7 @@ class DeepResearchAgent:
                 return {
                     "query_id": query_id,
                     "question": question,
-                    "predicted_answer": extract_answer(final),
+                    "predicted_answer": enforce_concrete_answer(extract_answer(final)),
                     "status": "no_new_info",
                     "messages": messages,
                     "num_tool_calls": num_tool_calls,
@@ -483,7 +502,7 @@ class DeepResearchAgent:
         # ── Max rounds — force answer ──
         messages.append({
             "role": "user",
-            "content": "Maximum rounds reached. Give your Best Guess answer now.\n\nFormat:\nExplanation: <reasoning>\nExact Answer: <answer>\nConfidence: low",
+            "content": "Maximum rounds reached. You MUST give your best guess now — 'cannot be determined' is NOT allowed.\n\nFormat:\nEvidence: <docids you examined>\nExact Answer: <your best guess — must be a specific answer>\nConfidence: low",
         })
         response = self.client.simple_chat(
             model=self.model_name,
@@ -496,7 +515,7 @@ class DeepResearchAgent:
         return {
             "query_id": query_id,
             "question": question,
-            "predicted_answer": extract_answer(final),
+            "predicted_answer": enforce_concrete_answer(extract_answer(final)),
             "status": "max_rounds_reached",
             "messages": messages,
             "num_tool_calls": num_tool_calls,

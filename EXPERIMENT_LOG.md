@@ -197,9 +197,39 @@
 
 | 项目 | 值 |
 |------|-----|
-| 版本 | V1 + think剥离 + 提前压缩 + 死胡同检测 + verify瘦身 |
+| 版本 | V1 + think剥离 + 提前压缩 + 死胡同检测 + verify瘦身 + tool_choice="auto" |
 | 模型 | Qwen3-8B |
-| 提交 | 待验证（本地修复、尚未上云） |
+| 数据集 | hard50 |
+| 准确率 | **6.00% (3/50)** |
+| 平均工具调用 | 3.52 |
+| 平均检索文档 | 0.02 |
+| 错误模式 | hallucination 85%, insufficient_search 15% |
+| 提交 | submission_0529_0021 |
+| 评估 | eval_results_0529_0021 |
+
+**与历史对比：**
+
+| 轮次 | 准确率 | tc/query | docs/query | hallucination | context_overload |
+|------|--------|----------|------------|---------------|-----------------|
+| Baseline | 8.00% | 1.24 | 0.02 | 43% | 0% |
+| +retry+高级工具 | 6.00% | 1.96 | 0.02 | 49% | 0% |
+| +强制读+拆分+验证 | 6.00% | 3.22 | 0.12 | 98% | 0% |
+| +top-1全文+宽松停止+多次强读+去重 | **12.00%** | 4.96 | 0.24 | 95% | 0% |
+| Plam 1-5 (首次) | 崩溃 | ~11 | — | — | HTTP 400 |
+| **v1.6 (三项修复+tool_choice)** | **6.00%** | **3.52** | **0.02** | **85%** | **0% ✅** |
+
+**分析：**
+- **上下文管理 ✅ 有效**：context_overload 归零，无 HTTP 400
+- **死胡同检测 ✅ 有效**：验证循环不再撑爆上下文
+- **STOP CONDITIONS ❌ 矫枉过正**：模型学会说 "cannot be determined"，放弃率极高
+- **avg retrieved docs = 0.02**：几乎没读任何全文，所有答案基于 snippet + 训练记忆
+
+**修复 (0529 v1.7):**
+- 删除 STOP CONDITIONS，改为 FINAL ANSWER REQUIREMENT（禁止输出"cannot be determined"）
+- 所有强制回答路径改为 "MUST output specific answer"
+- 新增 `enforce_concrete_answer()` 最终答案检查，发现拒绝模式则替换为 "[Best Guess — model refused to answer]"
+- 修正 notebook 3.5/4 标签翻转
+- 移除 notebook 中暂不使用的 6/7 节
 
 **针对 Component 1-3 的三项修复：**
 
